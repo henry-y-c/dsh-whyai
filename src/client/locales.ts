@@ -4,6 +4,16 @@ export const zh = {
   paused: '已暂停更新', unavailable: '读取失败，稍后重试', auth: '需要登录或授权',
   limited: '请求受限，稍后重试', timeout: '读取超时，稍后重试', invalid: '响应数据无效',
   disabled: '账号已停用', billingUnavailable: '账单日期暂不可用',
+  installBtn: '安装', loginBtn: '登录',
+  installing: '正在安装…', loggingIn: '正在登录…',
+  installSuccess: '安装成功', installFailed: '安装失败',
+  loginSuccess: '登录完成', loginFailed: '登录失败',
+  loginPrompt: '请在打开的浏览器中完成授权…',
+  fetchingData: '获取数据',
+  logoutBtn: '退出',
+  loggingOut: '正在退出…',
+  logoutSuccess: '已退出登录',
+  logoutFailed: '退出失败',
 }
 export type LocaleKey = keyof typeof zh
 export const en: Record<LocaleKey, string> = {
@@ -12,4 +22,14 @@ export const en: Record<LocaleKey, string> = {
   paused: 'Updates paused', unavailable: 'Unable to load; retrying later', auth: 'Sign-in or authorization required',
   limited: 'Rate limited; retrying later', timeout: 'Request timed out; retrying later', invalid: 'Invalid response data',
   disabled: 'Account disabled', billingUnavailable: 'Billing dates temporarily unavailable',
+  installBtn: 'Install', loginBtn: 'Log In',
+  installing: 'Installing…', loggingIn: 'Logging in…',
+  installSuccess: 'Installed successfully', installFailed: 'Installation failed',
+  loginSuccess: 'Login complete', loginFailed: 'Login failed',
+  loginPrompt: 'Please complete authorization in your browser…',
+  fetchingData: 'Fetching data…',
+  logoutBtn: 'Logout',
+  loggingOut: 'Logging out…',
+  logoutSuccess: 'Logged out',
+  logoutFailed: 'Logout failed',
 }

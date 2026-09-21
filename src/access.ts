@@ -62,8 +62,13 @@ export class WhyAiAccess {
 
   constructor(private readonly runner: Pick<WhyAiCliRunner, 'invoke'>) {}
 
-  get(): Promise<AccessResult> {
+  invalidate(): void {
+    this.cache = undefined
+  }
+
+  get(forceFresh = false): Promise<AccessResult> {
     if (this.disposed) return Promise.resolve({ status: 'error', code: 'WHYAI_DISPOSED' })
+    if (forceFresh) this.cache = undefined
     if (this.cache && Date.now() < this.cache.expires) return Promise.resolve(this.cache.result)
     if (this.flight) return this.flight.promise
     const controller = new AbortController()

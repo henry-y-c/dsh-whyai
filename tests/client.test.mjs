@@ -2,12 +2,13 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import vm from 'node:vm'
 import { build } from 'esbuild'
+import { fileURLToPath } from 'node:url'
 
 async function load(entry, overrides = {}) {
-  const { outputFiles } = await build({ entryPoints: [new URL(`../src/client/${entry}.ts`, import.meta.url).pathname], bundle: true, platform: 'browser', format: 'cjs', external: ['react'], write: false })
+  const { outputFiles } = await build({ entryPoints: [fileURLToPath(new URL(`../src/client/${entry}.ts`, import.meta.url))], bundle: true, platform: 'browser', format: 'cjs', external: ['react'], write: false })
   const module = { exports: {} }
   const context = { module, exports: module.exports, console, AbortController, TextDecoder, Uint8Array, setTimeout, clearTimeout, queueMicrotask, fetch,
-    require: name => { assert.equal(name, 'react'); return { useId: () => 'test-popover', createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }) } }, ...overrides }
+    require: name => { assert.equal(name, 'react'); return { useId: () => 'test-popover', useState: (init) => [typeof init === 'function' ? init() : init, () => {}], createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }) } }, ...overrides }
   vm.runInNewContext(outputFiles[0].text, context)
   return module.exports
 }
@@ -205,3 +206,64 @@ test('HTTP failure and oversized/malformed response clear success data and sanit
     off(); await flush(); assert.equal(env.timers.size, 0)
   }
 })
+
+test('action buttons are shown on read failure and hidden on read success', async () => {
+  const { AccessSummary } = await load('summary')
+  const { zh } = await load('locales')
+
+  // When reading succeeds, details and logout button are shown; install/login buttons must NOT be present
+  const successNode = AccessSummary({ wide: true, t: key => zh[key], useAccess: selector => selector({ loading: false, data }) })
+  assert.ok(!text(successNode).includes(zh.installBtn))
+  assert.ok(!text(successNode).includes(zh.loginBtn))
+  assert.ok(text(successNode).includes(zh.remaining))
+  assert.ok(text(successNode).includes(zh.expiry))
+  assert.ok(text(successNode).includes(zh.reset))
+  assert.ok(text(successNode).includes(zh.logoutBtn))
+
+  // When reading fails, ONLY brand and the two action buttons appear; details, error texts, and logout button MUST NOT appear
+  const errorNode = AccessSummary({ wide: true, t: key => zh[key], useAccess: selector => selector({ loading: false, error: 'unavailable' }) })
+  assert.ok(text(errorNode).includes(zh.brand))
+  assert.ok(text(errorNode).includes(zh.installBtn))
+  assert.ok(text(errorNode).includes(zh.loginBtn))
+  // Disallowed items on failure:
+  assert.ok(!text(errorNode).includes(zh.unavailable))
+  assert.ok(!text(errorNode).includes(zh.remaining))
+  assert.ok(!text(errorNode).includes(zh.expiry))
+  assert.ok(!text(errorNode).includes(zh.reset))
+  assert.ok(!text(errorNode).includes(zh.logoutBtn))
+
+  // When reading has no data, only brand and action buttons are present
+  const noDataNode = AccessSummary({ wide: true, t: key => zh[key], useAccess: selector => selector({ loading: false }) })
+  assert.ok(text(noDataNode).includes(zh.installBtn))
+  assert.ok(text(noDataNode).includes(zh.loginBtn))
+  assert.ok(!text(noDataNode).includes(zh.remaining))
+  assert.ok(!text(noDataNode).includes(zh.expiry))
+  assert.ok(!text(noDataNode).includes(zh.reset))
+  assert.ok(!text(noDataNode).includes(zh.logoutBtn))
+
+  assert.equal(zh.fetchingData, '获取数据')
+  assert.equal(zh.logoutBtn, '退出')
+})
+
+test('when data exists, refreshing in background hides buttons and shows content', async () => {
+  const { AccessSummary } = await load('summary')
+  const { zh } = await load('locales')
+
+  // When refreshing with data (state.loading: true, data present):
+  const refreshingNode = AccessSummary({ wide: true, t: key => zh[key], useAccess: selector => selector({ loading: true, data }) })
+  assert.ok(!text(refreshingNode).includes(zh.installBtn))
+  assert.ok(!text(refreshingNode).includes(zh.loginBtn))
+  assert.ok(text(refreshingNode).includes(zh.remaining))
+  assert.ok(text(refreshingNode).includes(zh.expiry))
+  assert.ok(text(refreshingNode).includes(zh.reset))
+
+  // When initial loading without data yet (state.loading: true, data: undefined):
+  const initialLoadingNode = AccessSummary({ wide: true, t: key => zh[key], useAccess: selector => selector({ loading: true }) })
+  // Action buttons must NOT be shown while loading in background
+  assert.ok(!text(initialLoadingNode).includes(zh.installBtn))
+  assert.ok(!text(initialLoadingNode).includes(zh.loginBtn))
+  assert.ok(text(initialLoadingNode).includes(zh.fetchingData))
+})
+
+
+

@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { build } from 'esbuild'
+import { fileURLToPath } from 'node:url'
 import { apply } from '../lib/index.js'
 import { CONFIG, fakeContext, NodeSubprocess } from './helpers.mjs'
 
-const bundle = await build({ stdin: { contents: "export * from './src/access.ts'; export * from './src/routes.ts'; export { WhyAiCliError, WhyAiCliRunner } from './src/runner.ts'", resolveDir: new URL('..', import.meta.url).pathname }, bundle: true, write: false, format: 'esm', platform: 'node' })
+const bundle = await build({ stdin: { contents: "export * from './src/access.ts'; export * from './src/routes.ts'; export { WhyAiCliError, WhyAiCliRunner } from './src/runner.ts'", resolveDir: fileURLToPath(new URL('..', import.meta.url)) }, bundle: true, write: false, format: 'esm', platform: 'node' })
 const { WhyAiAccess, installAccessRoute, WhyAiCliError, WhyAiCliRunner } = await import(`data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].text).toString('base64')}`)
 const accessValue = { eligible: true, available_percent: 75, valid_until: '2099-01-01T00:00:00Z' }
 const summaryValue = { plan_source: 'subscription', plan_expires_at: '2099-02-01T00:00:00Z', next_reset_at: '2098-12-15T00:00:00Z' }

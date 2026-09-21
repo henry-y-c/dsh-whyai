@@ -44,6 +44,32 @@ export function parseAccess(value: unknown): AccessData {
   return { available_percent: percent, eligible: data.eligible, valid_until: expiry, subscription_expires_at: subscription as string | null, next_reset_at: reset as string | null, billing_status: billing }
 }
 
+const CACHE_KEY = 'dsh_whyai_access_cache'
+
+export function loadSavedAccess(): AccessData | undefined {
+  if (typeof localStorage === 'undefined') return undefined
+  try {
+    const raw = localStorage.getItem(CACHE_KEY)
+    if (!raw) return undefined
+    return parseAccess(JSON.parse(raw))
+  } catch {
+    return undefined
+  }
+}
+
+export function saveAccess(data: AccessData | undefined): void {
+  if (typeof localStorage === 'undefined') return
+  try {
+    if (data) {
+      localStorage.setItem(CACHE_KEY, JSON.stringify({ status: 'ok', data }))
+    } else {
+      localStorage.removeItem(CACHE_KEY)
+    }
+  } catch {
+    // Ignore storage quota or security errors
+  }
+}
+
 /** Bound the complete body before parsing; a single oversized chunk is rejected. */
 async function readAccess(response: Response, signal: AbortSignal): Promise<AccessData> {
   if (signal.aborted) {
@@ -83,14 +109,95 @@ async function readAccess(response: Response, signal: AbortSignal): Promise<Acce
   }
 }
 
+export async function executeInstall(): Promise<{ ok: boolean; message: string; version?: string }> {
+  try {
+    const res = await fetch('/api/whyai/install', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { accept: 'application/json' },
+    })
+    const body = await res.json().catch(() => ({})) as Record<string, unknown>
+    if (!res.ok || body.status !== 'ok') {
+      return { ok: false, message: typeof body.message === 'string' ? body.message : `HTTP ${res.status}` }
+    }
+    return {
+      ok: true,
+      message: typeof body.message === 'string' ? body.message : 'OK',
+      version: typeof body.version === 'string' ? body.version : undefined,
+    }
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : 'Network error' }
+  }
+}
+
+export async function executeLogin(): Promise<{ ok: boolean; message: string }> {
+  try {
+    const res = await fetch('/api/whyai/login', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { accept: 'application/json' },
+    })
+    const body = await res.json().catch(() => ({})) as Record<string, unknown>
+    if (!res.ok || body.status !== 'ok') {
+      return { ok: false, message: typeof body.message === 'string' ? body.message : `HTTP ${res.status}` }
+    }
+    return {
+      ok: true,
+      message: typeof body.message === 'string' ? body.message : 'OK',
+    }
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : 'Network error' }
+  }
+}
+
+export async function executeLogout(): Promise<{ ok: boolean; message: string }> {
+  try {
+    const res = await fetch('/api/whyai/logout', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { accept: 'application/json' },
+    })
+    const body = await res.json().catch(() => ({})) as Record<string, unknown>
+    if (!res.ok || body.status !== 'ok') {
+      return { ok: false, message: typeof body.message === 'string' ? body.message : `HTTP ${res.status}` }
+    }
+    return {
+      ok: true,
+      message: typeof body.message === 'string' ? body.message : 'OK',
+    }
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : 'Network error' }
+  }
+}
+
 /** One subscription-owned poller; hidden pages and the last unsubscribe cancel all work. */
 export class AccessStore implements Observable<AccessState> {
-  #state: AccessState = { loading: true }
+  static current?: AccessStore
+
+  #state: AccessState = { loading: true, data: loadSavedAccess() }
   #listeners = new Set<() => void>()
   #timer?: ReturnType<typeof setTimeout>
   #cancel?: () => void
   #generation = 0
   #disposed = false
+
+  constructor() {
+    AccessStore.current = this
+  }
+
+  static reload(fresh = true): Promise<AccessState> {
+    if (AccessStore.current) {
+      return AccessStore.current.reload(fresh)
+    }
+    return Promise.resolve({ loading: false })
+  }
+
+  static clear(): void {
+    if (AccessStore.current) {
+      AccessStore.current.clear()
+    }
+  }
+
   getSnapshot = (): AccessState => this.#state
   #visible = (): boolean => typeof document === 'undefined' || !document.hidden
   #publish(state: AccessState): void {
@@ -107,8 +214,9 @@ export class AccessStore implements Observable<AccessState> {
   #visibility = (): void => {
     this.#stop()
     // Clear old account data while hidden, including during a login change.
-    this.#publish({ loading: this.#visible(), ...(this.#visible() ? {} : { error: 'paused' as const }) })
-    if (this.#visible()) void this.#load()
+    const isVis = this.#visible()
+    this.#publish({ loading: isVis, ...(isVis ? { data: this.#state.data ?? loadSavedAccess() } : { error: 'paused' as const }) })
+    if (isVis) void this.#load()
   }
   subscribe = (listener: () => void): (() => void) => {
     if (this.#disposed) return () => {}
@@ -126,13 +234,26 @@ export class AccessStore implements Observable<AccessState> {
     }
   }
   dispose = (): void => {
+    if (AccessStore.current === this) AccessStore.current = undefined
     this.#disposed = true
     this.#stop()
     if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', this.#visibility)
     this.#listeners.clear()
     this.#state = { loading: true }
   }
-  async #load(): Promise<void> {
+  clear = (): void => {
+    saveAccess(undefined)
+    this.#stop()
+    this.#publish({ loading: false, data: undefined, error: 'auth' })
+  }
+  reload = async (fresh = true): Promise<AccessState> => {
+    if (this.#disposed) return this.#state
+    this.#stop()
+    this.#publish({ loading: true, data: this.#state.data ?? loadSavedAccess() })
+    await this.#load(fresh)
+    return this.#state
+  }
+  async #load(fresh = false): Promise<void> {
     if (this.#cancel || this.#disposed || !this.#listeners.size || !this.#visible()) return
     const generation = ++this.#generation
     const controller = new AbortController()
@@ -141,15 +262,20 @@ export class AccessStore implements Observable<AccessState> {
     const cancel = (reason: string) => { reject(new Error(reason)); controller.abort() }
     this.#cancel = () => cancel('unavailable')
     const timeout = setTimeout(() => cancel('timeout'), TIMEOUT_MS)
-    const work = (async () => readAccess(await fetch('/api/whyai/access', {
-      method: 'GET', credentials: 'same-origin', cache: 'no-store', headers: { accept: 'application/json' }, signal: controller.signal,
+    const url = fresh ? '/api/whyai/access?fresh=1' : '/api/whyai/access'
+    const work = (async () => readAccess(await fetch(url, {
+      method: 'GET', credentials: 'same-origin', cache: 'no-store', headers: { accept: 'application/json', 'cache-control': 'no-cache' }, signal: controller.signal,
     }), controller.signal))()
     try {
       const data = await Promise.race([work, cancelled])
-      if (generation === this.#generation) this.#publish({ loading: false, data })
+      if (generation === this.#generation) {
+        saveAccess(data)
+        this.#publish({ loading: false, data, error: undefined })
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : ''
       const safe = ['auth', 'limited', 'timeout', 'invalid', 'disabled'].includes(message) ? message as LocaleKey : 'unavailable'
+      if (safe === 'auth') saveAccess(undefined)
       if (generation === this.#generation) this.#publish({ loading: false, error: safe })
     } finally {
       clearTimeout(timeout)
