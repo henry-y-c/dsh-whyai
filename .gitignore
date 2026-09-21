@@ -1,0 +1,8 @@
+node_modules/
+lib/
+.npm-cache/
+coverage/
+.tmp-composition-*/
+.tmp-pack-*/
+*.tgz
+.DS_Store

@@ -1,0 +1,14 @@
+.github/
+.githooks/
+.npm-cache/
+.tmp-composition-*/
+.tmp-pack-*/
+AGENTS.md
+CONTRIBUTING.md
+SECURITY.md
+CODE_OF_CONDUCT.md
+RELEASING.md
+scripts/
+src/
+tests/
+tsconfig.json

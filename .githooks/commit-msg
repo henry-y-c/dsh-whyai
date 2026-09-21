@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+import re
+import sys
+from pathlib import Path
+
+message = Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()[0]
+pattern = r"^(feat|fix|docs|test|refactor|perf|build|ci|chore|revert)(\([a-z0-9._/-]+\))?!?: .+"
+if not re.match(pattern, message):
+    print("commit message must follow Conventional Commits", file=sys.stderr)
+    raise SystemExit(1)
