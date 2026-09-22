@@ -4,6 +4,15 @@
 
 公开目标：[GitHub · henry-y-c/dsh-whyai](https://github.com/henry-y-c/dsh-whyai) · [npm · dsh-whyai](https://www.npmjs.com/package/dsh-whyai)。当前发布与真人验收状态见 [README](README.md)。
 
+## 未发布
+
+### 新增
+
+- 侧栏增加一键安装、登录与退出快捷操作支持，并通过 DSH 受管子进程与 runner 统一调度。
+- 支持标准安装目录回退探测（macOS/Linux: `~/.local/bin/whyai`，Windows: `%LOCALAPPDATA%\WhyAI\bin\whyai.cmd`），无需改写全局 `process.env.PATH`。
+- 优化前端额度轮询体验：后台静默刷新保持卡片稳定无白屏闪烁；移除 `localStorage`，采用内存状态代次与严格请求取消机制，杜绝账号切换时的旧数据回灌。
+- 完善 Windows 跨平台测试路径兼容 (`fileURLToPath`)。
+
 ## 0.3.1
 
 ### 修复

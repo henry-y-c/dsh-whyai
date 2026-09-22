@@ -280,3 +280,20 @@ test('host requires only tools/subprocess and registers optional Web injection',
   assert.equal(harness.tools.size, 4)
   await harness.dispose()
 })
+
+test('invalidate cancels in-flight request and does not repopulate cache with old result', async () => {
+  let release
+  const delayed = new Promise((r) => { release = r })
+  const access = new WhyAiAccess({
+    invoke: async (args) => ok(args.at(-1) === 'access' ? await delayed : summaryValue),
+  })
+  const oldFlight = access.get()
+  await flush()
+  access.invalidate()
+  const freshFlight = access.get(true)
+  assert.notEqual(freshFlight, oldFlight)
+  release({ eligible: true, available_percent: 42, valid_until: '2099-01-01T00:00:00Z' })
+  await oldFlight.catch(() => {})
+  await freshFlight.catch(() => {})
+  await access.dispose()
+})

@@ -21,10 +21,10 @@ const MUTATING_TOOLS = new Set<string>([TOOL_NAMES.create, TOOL_NAMES.send])
 export function apply(ctx: PluginContext, config: WhyAiConfig): void {
   validateConfig(config)
   const runner = new WhyAiCliRunner(ctx.subprocess, config)
-  const actions = new WhyAiActions()
   for (const tool of createToolDefinitions(runner, config, ctx.logger)) ctx.tools.register(tool)
   ctx.inject(['webServer', 'connection'], (webCtx) => {
     const accessRef: { current?: any } = {}
+    const actions = new WhyAiActions(ctx.subprocess, config, runner, () => accessRef.current?.invalidate())
     installAccessRoute(webCtx, runner, accessRef)
     installActionRoutes(webCtx, actions, () => accessRef.current?.invalidate())
   })

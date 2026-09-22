@@ -1,6 +1,5 @@
 import { createElement as h, useId, useState } from 'react'
-import { AccessStore, executeInstall, executeLogin, executeLogout, loadSavedAccess, saveAccess } from './store.ts'
-import type { AccessData } from './store.ts'
+import { AccessStore, executeInstall, executeLogin, executeLogout } from './store.ts'
 import type { SidebarProps } from './types.ts'
 
 const muted = { color: 'var(--dsw-alias-label-tertiary)', fontSize: 11 }
@@ -17,19 +16,7 @@ export function AccessSummary({ wide, t, useAccess }: SidebarProps) {
   const [actionMessage, setActionMessage] = useState<string>('')
 
   const state = useAccess(value => value)
-  const currentData = state.data
-  const [savedData, setSavedData] = useState<AccessData | undefined>(() => currentData ?? loadSavedAccess())
-
-  if (currentData && currentData !== savedData) {
-    setSavedData(currentData)
-    saveAccess(currentData)
-  } else if (state.error === 'auth' && savedData) {
-    setSavedData(undefined)
-    saveAccess(undefined)
-  }
-
-  const effectiveData = currentData ?? (state.error === 'auth' ? undefined : savedData)
-  const data = effectiveData
+  const data = state.data
   const percent = data?.available_percent ?? null
   const value = percent === null ? '—' : `${Number(percent.toFixed(2))}%`
   const status = state.loading ? t('loading') : state.error ? t(state.error) : data ? t(data.eligible ? 'eligible' : 'ineligible') : t('unknown')
@@ -44,7 +31,9 @@ export function AccessSummary({ wide, t, useAccess }: SidebarProps) {
   const isBusy = actionStatus === 'installing' || actionStatus === 'loggingIn' || actionStatus === 'loggingOut' || actionStatus === 'fetching'
   const isSuccess = Boolean(data)
   const showLoading = !isSuccess && (state.loading || actionStatus === 'fetching')
-  const showButtons = !isSuccess && !state.loading && actionStatus !== 'fetching'
+  const canShowActions = !isSuccess && !state.loading && actionStatus !== 'fetching'
+  const showButtons = canShowActions && (!state.error || state.error === 'unavailable' || state.error === 'auth')
+  const showOtherError = canShowActions && !showButtons && Boolean(state.error)
 
   const handleInstall = async () => {
     if (isBusy) return
@@ -55,15 +44,8 @@ export function AccessSummary({ wide, t, useAccess }: SidebarProps) {
       setActionStatus('fetching')
       setActionMessage(t('fetchingData'))
       const next = await AccessStore.reload()
-      if (next.data && !next.error) {
-        setSavedData(next.data)
-        saveAccess(next.data)
-        setActionStatus('idle')
-        setActionMessage('')
-      } else {
-        setActionStatus('idle')
-        setActionMessage(result.version ? `${t('installSuccess')} (v${result.version})` : t('installSuccess'))
-      }
+      setActionStatus('idle')
+      setActionMessage(next.data ? '' : (result.version ? `${t('installSuccess')} (v${result.version})` : t('installSuccess')))
     } else {
       setActionStatus('error')
       setActionMessage(`${t('installFailed')}: ${result.message}`)
@@ -80,8 +62,6 @@ export function AccessSummary({ wide, t, useAccess }: SidebarProps) {
       setActionMessage(t('fetchingData'))
       const next = await AccessStore.reload()
       if (next.data && !next.error) {
-        setSavedData(next.data)
-        saveAccess(next.data)
         setActionStatus('idle')
         setActionMessage('')
       } else {
@@ -99,8 +79,6 @@ export function AccessSummary({ wide, t, useAccess }: SidebarProps) {
     setActionStatus('loggingOut')
     setActionMessage(t('loggingOut'))
     const result = await executeLogout()
-    setSavedData(undefined)
-    saveAccess(undefined)
     AccessStore.clear()
     if (result.ok) {
       setActionStatus('idle')
@@ -110,6 +88,46 @@ export function AccessSummary({ wide, t, useAccess }: SidebarProps) {
       setActionMessage(`${t('logoutFailed')}: ${result.message}`)
     }
   }
+
+  const installButton = h('button', {
+    type: 'button',
+    disabled: isBusy,
+    onClick: handleInstall,
+    style: {
+      flex: 1,
+      padding: '5px 8px',
+      borderRadius: 6,
+      border: '1px solid var(--dsw-alias-border-l2)',
+      background: 'var(--dsw-alias-fill-quaternary, rgba(255, 255, 255, 0.06))',
+      color: isBusy && actionStatus === 'installing' ? 'var(--dsw-alias-state-brand-primary, #3b82f6)' : 'var(--dsw-alias-label-primary)',
+      fontSize: 11,
+      fontWeight: 600,
+      cursor: isBusy ? 'not-allowed' : 'pointer',
+      opacity: isBusy && actionStatus !== 'installing' ? 0.6 : 1,
+      textAlign: 'center',
+      transition: 'all 0.15s ease',
+    },
+  }, actionStatus === 'installing' ? t('installing') : t('installBtn'))
+
+  const loginButton = h('button', {
+    type: 'button',
+    disabled: isBusy,
+    onClick: handleLogin,
+    style: {
+      flex: 1,
+      padding: '5px 8px',
+      borderRadius: 6,
+      border: '1px solid var(--dsw-alias-border-l2)',
+      background: 'var(--dsw-alias-fill-quaternary, rgba(255, 255, 255, 0.06))',
+      color: isBusy && actionStatus === 'loggingIn' ? 'var(--dsw-alias-state-brand-primary, #3b82f6)' : 'var(--dsw-alias-label-primary)',
+      fontSize: 11,
+      fontWeight: 600,
+      cursor: isBusy ? 'not-allowed' : 'pointer',
+      opacity: isBusy && actionStatus !== 'loggingIn' ? 0.6 : 1,
+      textAlign: 'center',
+      transition: 'all 0.15s ease',
+    },
+  }, actionStatus === 'loggingIn' ? t('loggingIn') : t('loginBtn'))
 
   const content = h('section', { 'aria-label': t('title'), style: panel },
     h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 8 } },
@@ -161,47 +179,9 @@ export function AccessSummary({ wide, t, useAccess }: SidebarProps) {
         color: 'var(--dsw-alias-state-brand-primary, #3b82f6)',
       },
     }, t('fetchingData')) : null,
-    showButtons ? h('div', { style: { display: 'flex', gap: 6, marginTop: 10 } },
-      h('button', {
-        type: 'button',
-        disabled: isBusy,
-        onClick: handleInstall,
-        style: {
-          flex: 1,
-          padding: '5px 8px',
-          borderRadius: 6,
-          border: '1px solid var(--dsw-alias-border-l2)',
-          background: 'var(--dsw-alias-fill-quaternary, rgba(255, 255, 255, 0.06))',
-          color: isBusy && actionStatus === 'installing' ? 'var(--dsw-alias-state-brand-primary, #3b82f6)' : 'var(--dsw-alias-label-primary)',
-          fontSize: 11,
-          fontWeight: 600,
-          cursor: isBusy ? 'not-allowed' : 'pointer',
-          opacity: isBusy && actionStatus !== 'installing' ? 0.6 : 1,
-          textAlign: 'center',
-          transition: 'all 0.15s ease',
-        },
-      }, actionStatus === 'installing' ? t('installing') : t('installBtn')),
-      h('button', {
-        type: 'button',
-        disabled: isBusy,
-        onClick: handleLogin,
-        style: {
-          flex: 1,
-          padding: '5px 8px',
-          borderRadius: 6,
-          border: '1px solid var(--dsw-alias-border-l2)',
-          background: 'var(--dsw-alias-fill-quaternary, rgba(255, 255, 255, 0.06))',
-          color: isBusy && actionStatus === 'loggingIn' ? 'var(--dsw-alias-state-brand-primary, #3b82f6)' : 'var(--dsw-alias-label-primary)',
-          fontSize: 11,
-          fontWeight: 600,
-          cursor: isBusy ? 'not-allowed' : 'pointer',
-          opacity: isBusy && actionStatus !== 'loggingIn' ? 0.6 : 1,
-          textAlign: 'center',
-          transition: 'all 0.15s ease',
-        },
-      }, actionStatus === 'loggingIn' ? t('loggingIn') : t('loginBtn')),
-    ) : null,
-    showButtons && actionMessage ? h('div', {
+    showButtons ? h('div', { style: { display: 'flex', gap: 6, marginTop: 10 } }, installButton, loginButton) : null,
+    showOtherError ? h('div', { role: 'status', style: { ...muted, marginTop: 8 } }, t(state.error!)) : null,
+    canShowActions && actionMessage ? h('div', {
       role: 'status',
       style: {
         marginTop: 6,

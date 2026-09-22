@@ -1,3 +1,5 @@
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import type { SubprocessHandle, SubprocessRuntime } from './dsh-types.ts'
 import type { WhyAiConfig } from './config.ts'
 
@@ -14,7 +16,7 @@ export interface CliInvocation {
   hadWarning: boolean
 }
 
-interface RawInvocation {
+export interface RawInvocation {
   exitCode: number
   stdout: string
   stderr: string
@@ -89,6 +91,15 @@ function readComplete(
 }
 
 const DISPOSED = Symbol('WhyAI plugin disposed')
+
+export function getStandardCliFallback(): string | undefined {
+  const home = homedir()
+  if (process.platform === 'win32') {
+    const localAppData = process.env.LOCALAPPDATA || join(home, 'AppData', 'Local')
+    return join(localAppData, 'WhyAI', 'bin', 'whyai.cmd')
+  }
+  return join(home, '.local', 'bin', 'whyai')
+}
 
 function abortError(signal: AbortSignal, timeout?: AbortSignal): WhyAiCliError {
   if (signal.aborted && signal.reason === DISPOSED) return new WhyAiCliError('WhyAI plugin was disposed', 'WHYAI_DISPOSED')
@@ -170,6 +181,49 @@ export class WhyAiCliRunner {
       }
       return version
     })
+  }
+
+  async resolveExecutable(signal?: AbortSignal): Promise<string> {
+    const opSignal = signal ?? new AbortController().signal
+    try {
+      return await untilAbort(this.subprocess.resolveExecutable(this.config.cliPath, undefined, opSignal), opSignal)
+    } catch (error) {
+      if (opSignal.aborted) throw error
+      if (this.config.cliPath === 'whyai') {
+        const fallback = getStandardCliFallback()
+        if (fallback) {
+          try {
+            return await untilAbort(this.subprocess.resolveExecutable(fallback, undefined, opSignal), opSignal)
+          } catch {
+            // fallback lookup also failed; fall through to standard error
+          }
+        }
+      }
+      throw new WhyAiCliError('WhyAI CLI executable could not be resolved', 'WHYAI_EXECUTABLE_NOT_FOUND')
+    }
+  }
+
+  async invokeRaw(
+    args: readonly string[],
+    stdin: string | undefined,
+    signal: AbortSignal,
+    timeoutMs?: number,
+  ): Promise<RawInvocation> {
+    return this.serialized(signal, async (operationSignal) => {
+      if (operationSignal.aborted) throw abortError(signal)
+      const effectiveTimeout = timeoutMs ?? this.config.timeoutMs
+      const timeout = new AbortController()
+      const timer = setTimeout(() => timeout.abort(), effectiveTimeout)
+      try {
+        return await this.runWithDeadline(args, stdin, operationSignal, timeout.signal)
+      } finally {
+        clearTimeout(timer)
+      }
+    })
+  }
+
+  async runTask<T>(signal: AbortSignal, task: (operationSignal: AbortSignal) => Promise<T>): Promise<T> {
+    return this.serialized(signal, task)
   }
 
   async dispose(): Promise<void> {
@@ -279,7 +333,7 @@ export class WhyAiCliRunner {
     const operationSignal = AbortSignal.any([signal, timeout])
     let executable: string
     try {
-      executable = await untilAbort(this.subprocess.resolveExecutable(this.config.cliPath, undefined, operationSignal), operationSignal)
+      executable = await this.resolveExecutable(operationSignal)
     } catch {
       if (operationSignal.aborted) throw abortError(signal, timeout)
       throw new WhyAiCliError('WhyAI CLI executable could not be resolved', 'WHYAI_EXECUTABLE_NOT_FOUND')

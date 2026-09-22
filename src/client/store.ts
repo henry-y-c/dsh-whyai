@@ -1,39 +1,40 @@
-import type { Observable } from './types.ts'
 import type { LocaleKey } from './locales.ts'
+import type { Observable } from './types.ts'
 
 export interface AccessData {
-  available_percent: number | null
-  eligible: boolean
-  valid_until: string | null
-  subscription_expires_at: string | null
-  next_reset_at: string | null
-  billing_status: 'ok' | 'unavailable'
+  readonly eligible: boolean
+  readonly available_percent: number | null
+  readonly valid_until: string | null
+  readonly subscription_expires_at: string | null
+  readonly next_reset_at: string | null
+  readonly billing_status: 'ok' | 'unavailable'
 }
-export interface AccessState { loading: boolean; data?: AccessData; error?: LocaleKey }
-const POLL_MS = 60_000
-const TIMEOUT_MS = 15_000
-const MAX_BYTES = 16_384
 
-/** Reject malformed wire values rather than converting missing allowance into zero. */
+export interface AccessState {
+  readonly loading: boolean
+  readonly data?: AccessData
+  readonly error?: LocaleKey
+}
+
+const TIMEOUT_MS = 15_000
+const POLL_MS = 60_000
+const MAX_BYTES = 16 * 1024
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/** Validate wire response; missing/extra billing fields fail closed to sanitize errors. */
 export function parseAccess(value: unknown): AccessData {
-  if (!value || typeof value !== 'object') throw new Error('invalid')
-  const response = value as Record<string, unknown>
-  if (response.status === 'error' && typeof response.code === 'string') {
-    const code = response.code.toUpperCase()
-    throw new Error(/AUTH|LOGIN|LOGGED_IN|UNAUTHORIZED|FORBIDDEN/.test(code) ? 'auth'
-      : /RATE|LIMIT/.test(code) ? 'limited' : /TIMEOUT/.test(code) ? 'timeout'
-        : /DISABLED/.test(code) ? 'disabled' : 'unavailable')
-  }
-  if (response.status !== 'ok' || !response.data || typeof response.data !== 'object') throw new Error('invalid')
-  const data = response.data as Record<string, unknown>
-  const percent = data.available_percent
-  const expiry = data.valid_until
-  if (!(percent === null || typeof percent === 'number' && Number.isFinite(percent) && percent >= 0 && percent <= 100)
-    || typeof data.eligible !== 'boolean'
-    || !(expiry === null || typeof expiry === 'string' && expiry.length <= 128 && Number.isFinite(Date.parse(expiry)))) throw new Error('invalid')
-  if (!Object.hasOwn(data, 'subscription_expires_at')
-    || !Object.hasOwn(data, 'next_reset_at')
-    || !Object.hasOwn(data, 'billing_status')) throw new Error('invalid')
+  if (!isRecord(value)) throw new Error('invalid')
+  if (value.status === 'error') throw new Error(value.code === 'WHYAI_AUTH_REQUIRED' || value.code === 'WHYAI_NOT_LOGGED_IN' ? 'auth' : 'unavailable')
+  if (value.status !== 'ok' || !isRecord(value.data)) throw new Error('invalid')
+  const data = value.data
+  const raw = data.available_percent
+  const percent = raw === null ? null : typeof raw === 'number' && Number.isFinite(raw) && raw >= 0 && raw <= 100 ? raw : undefined
+  if (percent === undefined || typeof data.eligible !== 'boolean') throw new Error('invalid')
+  const expiry = data.valid_until === null ? null : typeof data.valid_until === 'string' && data.valid_until.length <= 128 && Number.isFinite(Date.parse(data.valid_until)) ? data.valid_until : undefined
+  if (expiry === undefined) throw new Error('invalid')
   const subscription = data.subscription_expires_at
   const reset = data.next_reset_at
   for (const date of [subscription, reset]) {
@@ -42,32 +43,6 @@ export function parseAccess(value: unknown): AccessData {
   const billing = data.billing_status
   if (billing !== 'ok' && billing !== 'unavailable') throw new Error('invalid')
   return { available_percent: percent, eligible: data.eligible, valid_until: expiry, subscription_expires_at: subscription as string | null, next_reset_at: reset as string | null, billing_status: billing }
-}
-
-const CACHE_KEY = 'dsh_whyai_access_cache'
-
-export function loadSavedAccess(): AccessData | undefined {
-  if (typeof localStorage === 'undefined') return undefined
-  try {
-    const raw = localStorage.getItem(CACHE_KEY)
-    if (!raw) return undefined
-    return parseAccess(JSON.parse(raw))
-  } catch {
-    return undefined
-  }
-}
-
-export function saveAccess(data: AccessData | undefined): void {
-  if (typeof localStorage === 'undefined') return
-  try {
-    if (data) {
-      localStorage.setItem(CACHE_KEY, JSON.stringify({ status: 'ok', data }))
-    } else {
-      localStorage.removeItem(CACHE_KEY)
-    }
-  } catch {
-    // Ignore storage quota or security errors
-  }
 }
 
 /** Bound the complete body before parsing; a single oversized chunk is rejected. */
@@ -109,12 +84,13 @@ async function readAccess(response: Response, signal: AbortSignal): Promise<Acce
   }
 }
 
-export async function executeInstall(): Promise<{ ok: boolean; message: string; version?: string }> {
+export async function executeInstall(signal?: AbortSignal): Promise<{ ok: boolean; message: string; version?: string }> {
   try {
     const res = await fetch('/api/whyai/install', {
       method: 'POST',
       credentials: 'same-origin',
       headers: { accept: 'application/json' },
+      signal: signal ?? AbortSignal.timeout(180_000),
     })
     const body = await res.json().catch(() => ({})) as Record<string, unknown>
     if (!res.ok || body.status !== 'ok') {
@@ -130,12 +106,13 @@ export async function executeInstall(): Promise<{ ok: boolean; message: string; 
   }
 }
 
-export async function executeLogin(): Promise<{ ok: boolean; message: string }> {
+export async function executeLogin(signal?: AbortSignal): Promise<{ ok: boolean; message: string }> {
   try {
     const res = await fetch('/api/whyai/login', {
       method: 'POST',
       credentials: 'same-origin',
       headers: { accept: 'application/json' },
+      signal: signal ?? AbortSignal.timeout(180_000),
     })
     const body = await res.json().catch(() => ({})) as Record<string, unknown>
     if (!res.ok || body.status !== 'ok') {
@@ -150,12 +127,13 @@ export async function executeLogin(): Promise<{ ok: boolean; message: string }> 
   }
 }
 
-export async function executeLogout(): Promise<{ ok: boolean; message: string }> {
+export async function executeLogout(signal?: AbortSignal): Promise<{ ok: boolean; message: string }> {
   try {
     const res = await fetch('/api/whyai/logout', {
       method: 'POST',
       credentials: 'same-origin',
       headers: { accept: 'application/json' },
+      signal: signal ?? AbortSignal.timeout(30_000),
     })
     const body = await res.json().catch(() => ({})) as Record<string, unknown>
     if (!res.ok || body.status !== 'ok') {
@@ -174,7 +152,7 @@ export async function executeLogout(): Promise<{ ok: boolean; message: string }>
 export class AccessStore implements Observable<AccessState> {
   static current?: AccessStore
 
-  #state: AccessState = { loading: true, data: loadSavedAccess() }
+  #state: AccessState = { loading: true }
   #listeners = new Set<() => void>()
   #timer?: ReturnType<typeof setTimeout>
   #cancel?: () => void
@@ -213,9 +191,8 @@ export class AccessStore implements Observable<AccessState> {
   }
   #visibility = (): void => {
     this.#stop()
-    // Clear old account data while hidden, including during a login change.
     const isVis = this.#visible()
-    this.#publish({ loading: isVis, ...(isVis ? { data: this.#state.data ?? loadSavedAccess() } : { error: 'paused' as const }) })
+    this.#publish({ loading: isVis, ...(isVis ? { data: this.#state.data } : { error: 'paused' as const }) })
     if (isVis) void this.#load()
   }
   subscribe = (listener: () => void): (() => void) => {
@@ -242,14 +219,13 @@ export class AccessStore implements Observable<AccessState> {
     this.#state = { loading: true }
   }
   clear = (): void => {
-    saveAccess(undefined)
     this.#stop()
     this.#publish({ loading: false, data: undefined, error: 'auth' })
   }
   reload = async (fresh = true): Promise<AccessState> => {
     if (this.#disposed) return this.#state
     this.#stop()
-    this.#publish({ loading: true, data: this.#state.data ?? loadSavedAccess() })
+    this.#publish({ loading: true, data: this.#state.data })
     await this.#load(fresh)
     return this.#state
   }
@@ -269,14 +245,14 @@ export class AccessStore implements Observable<AccessState> {
     try {
       const data = await Promise.race([work, cancelled])
       if (generation === this.#generation) {
-        saveAccess(data)
         this.#publish({ loading: false, data, error: undefined })
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : ''
       const safe = ['auth', 'limited', 'timeout', 'invalid', 'disabled'].includes(message) ? message as LocaleKey : 'unavailable'
-      if (safe === 'auth') saveAccess(undefined)
-      if (generation === this.#generation) this.#publish({ loading: false, error: safe })
+      if (generation === this.#generation) {
+        this.#publish({ loading: false, data: undefined, error: safe })
+      }
     } finally {
       clearTimeout(timeout)
       if (generation === this.#generation) {

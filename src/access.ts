@@ -57,6 +57,7 @@ function projectSummary(value: unknown): Pick<AccessData, 'subscription_expires_
 /** One route mount owns its cache, deadline and coalesced CLI invocation. */
 export class WhyAiAccess {
   private disposed = false
+  private generation = 0
   private cache?: { result: AccessResult; expires: number }
   private flight?: { promise: Promise<AccessResult>; cancel: () => void }
 
@@ -64,25 +65,38 @@ export class WhyAiAccess {
 
   invalidate(): void {
     this.cache = undefined
+    this.generation++
+    const flight = this.flight
+    this.flight = undefined
+    flight?.cancel()
   }
 
   get(forceFresh = false): Promise<AccessResult> {
     if (this.disposed) return Promise.resolve({ status: 'error', code: 'WHYAI_DISPOSED' })
-    if (forceFresh) this.cache = undefined
+    if (forceFresh) {
+      this.cache = undefined
+      this.generation++
+      const flight = this.flight
+      this.flight = undefined
+      flight?.cancel()
+    }
     if (this.cache && Date.now() < this.cache.expires) return Promise.resolve(this.cache.result)
     if (this.flight) return this.flight.promise
+    const currentGeneration = this.generation
     const controller = new AbortController()
     let settle!: (result: AccessResult) => void
     const promise = new Promise<AccessResult>((resolve) => { settle = resolve })
     let finished = false
     let cancellation: 'WHYAI_TIMEOUT' | 'WHYAI_DISPOSED' | undefined
     const finish = (result: AccessResult): void => {
-      if (cancellation) result = { status: 'error', code: cancellation }
       if (finished) return
       finished = true
       clearTimeout(timer)
-      if (!this.disposed) this.cache = { result: Object.freeze(result), expires: Date.now() + 30_000 }
-      this.flight = undefined
+      if (this.generation === currentGeneration) {
+        if (cancellation) result = { status: 'error', code: cancellation }
+        if (!this.disposed) this.cache = { result: Object.freeze(result), expires: Date.now() + 30_000 }
+        this.flight = undefined
+      }
       settle(result)
     }
     const timer = setTimeout(() => {
