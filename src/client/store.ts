@@ -1,63 +1,69 @@
-import type { Observable } from './types.ts'
 import type { LocaleKey } from './locales.ts'
+import type { Observable } from './types.ts'
 
 export interface AccessData {
-  available_percent: number | null
-  eligible: boolean
-  valid_until: string | null
-  subscription_expires_at: string | null
-  next_reset_at: string | null
-  billing_status: 'ok' | 'unavailable'
+  readonly eligible: boolean
+  readonly available_percent: number | null
+  readonly valid_until: string | null
+  readonly subscription_expires_at: string | null
+  readonly next_reset_at: string | null
+  readonly billing_status: 'ok' | 'unavailable'
 }
-export interface AccessState { loading: boolean; data?: AccessData; error?: LocaleKey }
-const POLL_MS = 60_000
-const TIMEOUT_MS = 15_000
-const MAX_BYTES = 16_384
-
-/** Reject malformed wire values rather than converting missing allowance into zero. */
+export type OperationKind = 'install' | 'login' | 'logout'
+export interface Operation { id: string; kind: OperationKind; phase: 'running' | 'succeeded' | 'failed' | 'cancelled'; code?: string; version?: string }
+export interface AccessState {
+  readonly loading: boolean
+  readonly data?: AccessData
+  readonly error?: LocaleKey
+  readonly stale?: boolean
+  readonly confirmation?: OperationKind
+  readonly pending?: boolean
+  readonly operation?: Operation
+  readonly actionError?: LocaleKey
+  readonly cancelRequested?: boolean
+  readonly watchPaused?: boolean
+}
+export function errorKey(code: unknown): LocaleKey {
+  if (code === 'WHYAI_AUTH_REQUIRED' || code === 'WHYAI_NOT_LOGGED_IN') return 'auth'
+  if (code === 'WHYAI_EXECUTABLE_NOT_FOUND') return 'missing'
+  if (code === 'WHYAI_INSTALL_CUSTOM_PATH_UNSUPPORTED') return 'customPath'
+  if (code === 'WHYAI_BUSY') return 'busy'
+  if (code === 'WHYAI_TIMEOUT') return 'timeout'
+  return 'unavailable'
+}
+function record(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value) }
 export function parseAccess(value: unknown): AccessData {
-  if (!value || typeof value !== 'object') throw new Error('invalid')
-  const response = value as Record<string, unknown>
-  if (response.status === 'error' && typeof response.code === 'string') {
-    const code = response.code.toUpperCase()
-    throw new Error(/AUTH|LOGIN|LOGGED_IN|UNAUTHORIZED|FORBIDDEN/.test(code) ? 'auth'
-      : /RATE|LIMIT/.test(code) ? 'limited' : /TIMEOUT/.test(code) ? 'timeout'
-        : /DISABLED/.test(code) ? 'disabled' : 'unavailable')
-  }
-  if (response.status !== 'ok' || !response.data || typeof response.data !== 'object') throw new Error('invalid')
-  const data = response.data as Record<string, unknown>
-  const percent = data.available_percent
-  const expiry = data.valid_until
-  if (!(percent === null || typeof percent === 'number' && Number.isFinite(percent) && percent >= 0 && percent <= 100)
-    || typeof data.eligible !== 'boolean'
-    || !(expiry === null || typeof expiry === 'string' && expiry.length <= 128 && Number.isFinite(Date.parse(expiry)))) throw new Error('invalid')
-  if (!Object.hasOwn(data, 'subscription_expires_at')
-    || !Object.hasOwn(data, 'next_reset_at')
-    || !Object.hasOwn(data, 'billing_status')) throw new Error('invalid')
-  const subscription = data.subscription_expires_at
-  const reset = data.next_reset_at
-  for (const date of [subscription, reset]) {
+  if (!record(value)) throw new Error('invalid')
+  if (value.status === 'error') throw new Error(errorKey(value.code))
+  if (value.status !== 'ok' || !record(value.data)) throw new Error('invalid')
+  const d = value.data
+  if (!(d.available_percent === null || typeof d.available_percent === 'number' && Number.isFinite(d.available_percent) && d.available_percent >= 0 && d.available_percent <= 100) || typeof d.eligible !== 'boolean') throw new Error('invalid')
+  for (const key of ['valid_until', 'subscription_expires_at', 'next_reset_at']) {
+    const date = d[key]
     if (!(date === null || typeof date === 'string' && date.length <= 128 && Number.isFinite(Date.parse(date)))) throw new Error('invalid')
   }
-  const billing = data.billing_status
-  if (billing !== 'ok' && billing !== 'unavailable') throw new Error('invalid')
-  return { available_percent: percent, eligible: data.eligible, valid_until: expiry, subscription_expires_at: subscription as string | null, next_reset_at: reset as string | null, billing_status: billing }
+  if (d.billing_status !== 'ok' && d.billing_status !== 'unavailable') throw new Error('invalid')
+  return { available_percent: d.available_percent, eligible: d.eligible, valid_until: d.valid_until as string | null, subscription_expires_at: d.subscription_expires_at as string | null, next_reset_at: d.next_reset_at as string | null, billing_status: d.billing_status }
 }
-
-/** Bound the complete body before parsing; a single oversized chunk is rejected. */
-async function readAccess(response: Response, signal: AbortSignal): Promise<AccessData> {
-  if (signal.aborted) {
+export function parseOperation(value: unknown): Operation | undefined {
+  if (!record(value)) throw new Error('invalid')
+  if (value.operation === null) return undefined
+  const op = value.operation
+  if (!record(op) || typeof op.id !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(op.id) || !['install', 'login', 'logout'].includes(op.kind as string) || !['running', 'succeeded', 'failed', 'cancelled'].includes(op.phase as string)) throw new Error('invalid')
+  if (op.code !== undefined && (typeof op.code !== 'string' || !/^WHYAI_[A-Z_]{1,80}$/.test(op.code))) throw new Error('invalid')
+  if (op.version !== undefined && (typeof op.version !== 'string' || !/^[0-9][a-zA-Z0-9.+-]{0,79}$/.test(op.version))) throw new Error('invalid')
+  return { id: op.id, kind: op.kind as OperationKind, phase: op.phase as Operation['phase'], ...(op.code ? { code: op.code as string } : {}), ...(op.version ? { version: op.version as string } : {}) }
+}
+const MAX_BYTES = 16 * 1024
+async function readBody(response: Response, signal: AbortSignal): Promise<unknown> {
+  if (signal.aborted || [401, 403, 429, 408, 504].includes(response.status)) {
     void response.body?.cancel().catch(() => {})
-    throw new Error('unavailable')
-  }
-  if (!response.ok && response.status !== 503) {
-    void response.body?.cancel().catch(() => {})
-    throw new Error(response.status === 401 || response.status === 403 ? 'auth' : response.status === 429 ? 'limited' : response.status === 504 || response.status === 408 ? 'timeout' : 'unavailable')
+    throw new Error(signal.aborted ? 'unavailable' : response.status === 401 ? 'dshAuth' : response.status === 403 ? 'forbidden' : response.status === 429 ? 'limited' : 'timeout')
   }
   if (!response.body) throw new Error('invalid')
   const reader = response.body.getReader()
-  const cancelReader = () => { void reader.cancel().catch(() => {}) }
-  signal.addEventListener('abort', cancelReader, { once: true })
+  const cancel = () => { void reader.cancel().catch(() => {}) }
+  signal.addEventListener('abort', cancel, { once: true })
   const chunks: Uint8Array[] = []
   let size = 0
   try {
@@ -72,43 +78,112 @@ async function readAccess(response: Response, signal: AbortSignal): Promise<Acce
     let offset = 0
     for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength }
     let value: unknown
-    try { value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)) }
-    catch { throw new Error('invalid') }
-    if (!response.ok && (!value || typeof value !== 'object' || (value as Record<string, unknown>).status !== 'error')) throw new Error('unavailable')
-    return parseAccess(value)
+    try { value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)) } catch { throw new Error('invalid') }
+    if (record(value) && value.status === 'error') throw new Error(errorKey(value.code))
+    if (!response.ok) throw new Error('unavailable')
+    return value
   } finally {
-    signal.removeEventListener('abort', cancelReader)
-    void reader.cancel().catch(() => {})
+    signal.removeEventListener('abort', cancel)
+    cancel()
     reader.releaseLock()
   }
 }
+function safeError(error: unknown): LocaleKey {
+  const message = error instanceof Error ? error.message : ''
+  return ['auth', 'missing', 'dshAuth', 'forbidden', 'busy', 'customPath', 'limited', 'timeout', 'invalid'].includes(message) ? message as LocaleKey : 'unavailable'
+}
 
-/** One subscription-owned poller; hidden pages and the last unsubscribe cancel all work. */
+/** Requests and timers belong to subscribers; stopping observation never cancels a host operation. */
 export class AccessStore implements Observable<AccessState> {
   #state: AccessState = { loading: true }
   #listeners = new Set<() => void>()
   #timer?: ReturnType<typeof setTimeout>
-  #cancel?: () => void
+  #requests = new Set<() => void>()
   #generation = 0
   #disposed = false
+  #working = false
+  #polls = 0
+  #lastOperationId?: string
+  #supersededOperationId?: string
   getSnapshot = (): AccessState => this.#state
-  #visible = (): boolean => typeof document === 'undefined' || !document.hidden
-  #publish(state: AccessState): void {
-    this.#state = state
-    for (const listener of this.#listeners) listener()
+  #visible = () => typeof document === 'undefined' || !document.hidden
+  #live = () => !this.#disposed && this.#listeners.size > 0 && this.#visible()
+  #publish(patch: Partial<AccessState>): void {
+    this.#state = { ...this.#state, ...patch }
+    for (const notify of this.#listeners) notify()
   }
   #stop(): void {
     ++this.#generation
     clearTimeout(this.#timer)
     this.#timer = undefined
-    this.#cancel?.()
-    this.#cancel = undefined
+    for (const cancel of this.#requests) cancel()
+    this.#requests.clear()
+    this.#working = false
+  }
+  async #request(path: string, method = 'GET'): Promise<unknown> {
+    const controller = new AbortController()
+    let reject!: (reason: Error) => void
+    const cancelled = new Promise<never>((_, fail) => { reject = fail })
+    const cancel = (reason = 'unavailable') => { reject(new Error(reason)); controller.abort() }
+    const dispose = () => cancel()
+    this.#requests.add(dispose)
+    const timeout = setTimeout(() => cancel('timeout'), 15_000)
+    const work = (async () => readBody(await fetch(`/api/whyai/${path}`, { method, credentials: 'same-origin', cache: 'no-store', headers: { accept: 'application/json' }, signal: controller.signal }), controller.signal))()
+    try { return await Promise.race([work, cancelled]) }
+    finally { clearTimeout(timeout); this.#requests.delete(dispose) }
+  }
+  #schedule(ms: number): void {
+    clearTimeout(this.#timer)
+    if (this.#live()) this.#timer = setTimeout(() => { this.#timer = undefined; void this.#refresh() }, ms)
+  }
+  #accept(op: Operation | undefined): void {
+    if (op) this.#lastOperationId = op.id
+    // A rejected/uncertain start must not borrow the previous operation's success.
+    if (op && op.id === this.#supersededOperationId) {
+      this.#publish({ operation: undefined, pending: false, watchPaused: false })
+      return
+    }
+    if (op) this.#supersededOperationId = undefined
+    const prev = this.#state.operation
+    const changed = op && (op.id !== prev?.id || op.phase !== prev.phase)
+    this.#publish({ operation: op, pending: false, watchPaused: false, ...(op ? { actionError: undefined } : {}), ...(changed ? { data: undefined, stale: false, error: undefined, confirmation: undefined } : {}), ...(op?.phase !== 'running' ? { cancelRequested: false } : {}) })
+  }
+  async #refresh(): Promise<void> {
+    if (!this.#live() || this.#working) return
+    this.#working = true
+    const generation = this.#generation
+    let operationRead = false
+    try {
+      const op = parseOperation(await this.#request('operation'))
+      if (generation !== this.#generation) return
+      operationRead = true
+      this.#accept(op)
+      if (op?.phase === 'running') {
+        this.#publish({ loading: false })
+        if (++this.#polls >= 180) this.#publish({ watchPaused: true, actionError: 'monitorPaused' })
+        else this.#schedule(2_000)
+        return
+      }
+      this.#polls = 0
+      this.#publish({ loading: true })
+      const data = parseAccess(await this.#request('access'))
+      if (generation === this.#generation) this.#publish({ data, error: undefined, stale: false, loading: false })
+    } catch (error) {
+      if (generation !== this.#generation) return
+      const key = safeError(error)
+      const clear = ['auth', 'missing', 'dshAuth', 'forbidden'].includes(key)
+      this.#publish({ loading: false, error: key, ...(clear ? { data: undefined, stale: false, confirmation: undefined } : { stale: !!this.#state.data }), ...(!operationRead && (this.#state.pending || this.#state.operation?.phase === 'running') ? { watchPaused: true, actionError: 'operationUnknown' } : {}) })
+    } finally {
+      if (generation === this.#generation) {
+        this.#working = false
+        if (!this.#timer && !this.#state.watchPaused) this.#schedule(60_000)
+      }
+    }
   }
   #visibility = (): void => {
     this.#stop()
-    // Clear old account data while hidden, including during a login change.
-    this.#publish({ loading: this.#visible(), ...(this.#visible() ? {} : { error: 'paused' as const }) })
-    if (this.#visible()) void this.#load()
+    this.#publish({ data: undefined, stale: false, confirmation: undefined, pending: false, cancelRequested: false, ...(this.#state.pending ? { watchPaused: true, actionError: 'operationUnknown' } : {}), loading: this.#visible(), error: this.#visible() ? undefined : 'paused' })
+    if (this.#visible()) { this.#polls = 0; void this.#refresh() }
   }
   subscribe = (listener: () => void): (() => void) => {
     if (this.#disposed) return () => {}
@@ -116,7 +191,8 @@ export class AccessStore implements Observable<AccessState> {
     this.#listeners.add(notify)
     if (this.#listeners.size === 1) {
       if (typeof document !== 'undefined') document.addEventListener('visibilitychange', this.#visibility)
-      if (this.#visible()) void this.#load()
+      this.#polls = 0
+      void this.#refresh()
     }
     return () => {
       if (!this.#listeners.delete(notify) || this.#listeners.size) return
@@ -132,31 +208,52 @@ export class AccessStore implements Observable<AccessState> {
     this.#listeners.clear()
     this.#state = { loading: true }
   }
-  async #load(): Promise<void> {
-    if (this.#cancel || this.#disposed || !this.#listeners.size || !this.#visible()) return
-    const generation = ++this.#generation
-    const controller = new AbortController()
-    let reject!: (error: Error) => void
-    const cancelled = new Promise<never>((_resolve, fail) => { reject = fail })
-    const cancel = (reason: string) => { reject(new Error(reason)); controller.abort() }
-    this.#cancel = () => cancel('unavailable')
-    const timeout = setTimeout(() => cancel('timeout'), TIMEOUT_MS)
-    const work = (async () => readAccess(await fetch('/api/whyai/access', {
-      method: 'GET', credentials: 'same-origin', cache: 'no-store', headers: { accept: 'application/json' }, signal: controller.signal,
-    }), controller.signal))()
+  prepare = (kind: OperationKind): void => {
+    if (!this.#live() || this.#state.pending || this.#state.operation?.phase === 'running') return
+    if (kind === 'install' ? this.#state.error !== 'missing' : kind === 'login' ? this.#state.error !== 'auth' : !this.#state.data) return
+    this.#publish({ confirmation: kind, actionError: undefined })
+  }
+  dismiss = (): void => { this.#publish({ confirmation: undefined }) }
+  confirm = async (): Promise<void> => {
+    const kind = this.#state.confirmation
+    if (!kind || !this.#live() || this.#state.pending || this.#state.operation?.phase === 'running') return
+    if (kind === 'install' ? this.#state.error !== 'missing' : kind === 'login' ? this.#state.error !== 'auth' : !this.#state.data) { this.dismiss(); return }
+    this.#stop()
+    const generation = this.#generation
+    this.#supersededOperationId = this.#lastOperationId
+    this.#publish({ confirmation: undefined, pending: true, data: undefined, stale: false, error: undefined, actionError: undefined, operation: undefined, cancelRequested: false, loading: false })
     try {
-      const data = await Promise.race([work, cancelled])
-      if (generation === this.#generation) this.#publish({ loading: false, data })
+      const op = parseOperation(await this.#request(`${kind}?confirm=host`, 'POST'))
+      if (!op || op.kind !== kind) throw new Error('invalid')
+      if (generation !== this.#generation) return
+      this.#accept(op)
     } catch (error) {
-      const message = error instanceof Error ? error.message : ''
-      const safe = ['auth', 'limited', 'timeout', 'invalid', 'disabled'].includes(message) ? message as LocaleKey : 'unavailable'
-      if (generation === this.#generation) this.#publish({ loading: false, error: safe })
-    } finally {
-      clearTimeout(timeout)
-      if (generation === this.#generation) {
-        this.#cancel = undefined
-        if (this.#listeners.size && this.#visible() && !this.#disposed) this.#timer = setTimeout(() => { void this.#load() }, POLL_MS)
-      }
+      if (generation !== this.#generation) return
+      // The POST may have reached the host: only GET can establish its outcome.
+      this.#publish({ pending: false, actionError: safeError(error), watchPaused: true })
     }
+    if (generation === this.#generation) { this.#polls = 0; void this.#refresh() }
+  }
+  cancel = async (): Promise<void> => {
+    const op = this.#state.operation
+    if (!this.#live() || op?.phase !== 'running' || this.#state.cancelRequested) return
+    this.#stop()
+    const generation = this.#generation
+    this.#publish({ cancelRequested: true, actionError: undefined })
+    try {
+      const result = parseOperation(await this.#request(`operation/cancel?id=${encodeURIComponent(op.id)}`, 'POST'))
+      if (!result || result.id !== op.id) throw new Error('invalid')
+      if (generation === this.#generation) this.#accept(result)
+    } catch (error) {
+      if (generation === this.#generation) this.#publish({ cancelRequested: false, actionError: safeError(error), watchPaused: true })
+    }
+    if (generation === this.#generation) { this.#polls = 0; void this.#refresh() }
+  }
+  retry = (): void => {
+    if (!this.#live() || this.#state.pending || this.#requests.size) return
+    this.#stop()
+    this.#polls = 0
+    this.#publish({ watchPaused: false, ...(!this.#supersededOperationId ? { actionError: undefined } : {}) })
+    void this.#refresh()
   }
 }

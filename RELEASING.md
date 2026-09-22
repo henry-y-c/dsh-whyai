@@ -4,13 +4,13 @@
 
 ## 发布前提
 
-当前准备发布 **0.3.1**，不补造历史版本日期。已确认目标：
+下一版本号尚未确定；功能开发与 PR 合并不构成发版授权。未经用户明确授权，不升级版本、不创建 tag、不发布 npm 或 GitHub Release。当前已发布版本与验收边界见 [README](README.md)。已确认目标：
 
 - GitHub：[henry-y-c/dsh-whyai](https://github.com/henry-y-c/dsh-whyai)；
 - npm：[dsh-whyai](https://www.npmjs.com/package/dsh-whyai)，发布账号 `henry-y-c`；
 - 作者：花辣子米；`repository`、`homepage`、`bugs` 均指向上述 GitHub 项目。
 
-首发前仍须核对：
+每次获准发布后仍须核对：
 
 - 仓库状态与待推送内容、npm 包名可用性和账号发布权限；目标确认不构成包名占位；
 - [安全策略](SECURITY.md) 中的私密报告渠道是否可用，不把未启用的入口写成可用；
@@ -32,7 +32,7 @@
 
 1. 确认工作区只包含本次发布内容。
 2. 扫描凭据、真实会话、日志和机器专属路径。
-3. 更新 `package.json` 与 `package-lock.json` 的版本。
+3. 按用户授权确定目标版本，再同步更新 `package.json` 与 `package-lock.json`；PR 修复阶段保持已有版本，变更记录留在“未发布”。
 4. 在 `CHANGELOG.md` 记录目标版本的变更；仅在实际发布时记录真实日期与结果，不提前宣称已发布。
 5. 运行：
 

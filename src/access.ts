@@ -18,7 +18,7 @@ const PUBLIC_CODES = new Set([
   'WHYAI_NOT_LOGGED_IN', 'WHYAI_QUOTA_EXHAUSTED', 'WHYAI_ACCOUNT_DISABLED',
   'WHYAI_PAID_PLAN_REQUIRED', 'WHYAI_COMMAND_FAILED', 'WHYAI_PROCESS_FAILED',
   'WHYAI_EXECUTABLE_NOT_FOUND', 'WHYAI_MALFORMED_OUTPUT', 'WHYAI_OUTPUT_OVERFLOW',
-  'WHYAI_TIMEOUT', 'WHYAI_CANCELLED', 'WHYAI_DISPOSED',
+  'WHYAI_TIMEOUT', 'WHYAI_CANCELLED', 'WHYAI_DISPOSED', 'WHYAI_BUSY',
 ])
 
 function timestamp(value: unknown): string | null {
@@ -57,27 +57,40 @@ function projectSummary(value: unknown): Pick<AccessData, 'subscription_expires_
 /** One route mount owns its cache, deadline and coalesced CLI invocation. */
 export class WhyAiAccess {
   private disposed = false
+  private generation = 0
   private cache?: { result: AccessResult; expires: number }
   private flight?: { promise: Promise<AccessResult>; cancel: () => void }
 
-  constructor(private readonly runner: Pick<WhyAiCliRunner, 'invoke'>) {}
+  constructor(private readonly runner: Pick<WhyAiCliRunner, 'invoke'>, private readonly managementBusy: () => boolean = () => false) {}
 
-  get(): Promise<AccessResult> {
+  invalidate(): void {
+    this.cache = undefined
+    this.generation++
+    this.flight?.cancel()
+  }
+
+  get(forceFresh = false): Promise<AccessResult> {
     if (this.disposed) return Promise.resolve({ status: 'error', code: 'WHYAI_DISPOSED' })
+    if (this.managementBusy()) return Promise.resolve({ status: 'error', code: 'WHYAI_BUSY' })
+    if (forceFresh) this.cache = undefined
     if (this.cache && Date.now() < this.cache.expires) return Promise.resolve(this.cache.result)
     if (this.flight) return this.flight.promise
+    const currentGeneration = this.generation
     const controller = new AbortController()
     let settle!: (result: AccessResult) => void
     const promise = new Promise<AccessResult>((resolve) => { settle = resolve })
     let finished = false
     let cancellation: 'WHYAI_TIMEOUT' | 'WHYAI_DISPOSED' | undefined
     const finish = (result: AccessResult): void => {
-      if (cancellation) result = { status: 'error', code: cancellation }
       if (finished) return
       finished = true
       clearTimeout(timer)
-      if (!this.disposed) this.cache = { result: Object.freeze(result), expires: Date.now() + 30_000 }
-      this.flight = undefined
+      if (cancellation) result = { status: 'error', code: cancellation }
+      if (this.generation !== currentGeneration) result = { status: 'error', code: 'WHYAI_CANCELLED' }
+      if (this.generation === currentGeneration && !this.disposed && !this.managementBusy()) {
+        this.cache = { result: Object.freeze(result), expires: Date.now() + 30_000 }
+      }
+      if (this.flight?.promise === promise) this.flight = undefined
       settle(result)
     }
     const timer = setTimeout(() => {

@@ -4,6 +4,7 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawn } from 'node:child_process'
 import { createServer } from 'node:net'
+import { setTimeout as delay } from 'node:timers/promises'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const home = join(root, `.tmp-composition-${process.pid}`)
@@ -41,7 +42,7 @@ function managedCommand(args, { timeoutMs, onData, onStop = () => {}, onExit = (
   if (process.platform === 'win32') throw new Error('test:composition requires POSIX process groups (macOS/Linux); Windows is unsupported')
   const child = spawn(dsh, args, {
     detached: true,
-    env: { ...process.env, DSH_HOME: home, MOCK_WHYAI_LOG: mockLog },
+    env: { ...process.env, DSH_HOME: home, MOCK_WHYAI_LOG: mockLog, MOCK_WHYAI_STATE: join(home, 'mock-auth-state') },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   let closed = false
@@ -142,7 +143,7 @@ async function command(args, timeoutMs = 60_000) {
   return { stdout, stderr }
 }
 
-async function probeWeb(port, token, signal) {
+async function probeWeb(port, token, signal, toolsDone) {
   assert.notEqual(port, 3080)
   const origin = `http://127.0.0.1:${port}`
   const request = (path, options = {}) => fetch(origin + path, { ...options, signal: AbortSignal.any([signal, AbortSignal.timeout(15_000)]) })
@@ -170,6 +171,36 @@ async function probeWeb(port, token, signal) {
   const combo = await get(entry.url)
   assert.equal(combo.status, 200)
   assert.match(await combo.text(), /sidebar\.footer\.action/u)
+
+  // These requests must fail before any management command is executed.
+  for (const kind of ['install', 'login', 'logout']) {
+    assert.equal((await request(`/api/whyai/${kind}?confirm=host`, { method: 'POST' })).status, 401)
+    assert.equal((await get(`/api/whyai/${kind}?confirm=host`, { method: 'POST', headers: { cookie, origin: 'https://attacker.invalid' } })).status, 403)
+    assert.equal((await get(`/api/whyai/${kind}`)).status, 405)
+    assert.equal((await get(`/api/whyai/${kind}`, { method: 'POST' })).status, 400)
+  }
+  assert.equal((await request('/api/whyai/operation')).status, 401)
+  assert.equal((await request('/api/whyai/operation/cancel?id=fixture', { method: 'POST' })).status, 401)
+  assert.deepEqual(await (await get('/api/whyai/operation')).json(), { operation: null })
+
+  // Let consultation probes finish first: management must not interrupt them.
+  await toolsDone
+  for (const kind of ['logout', 'login']) {
+    const startOperation = await get(`/api/whyai/${kind}?confirm=host`, { method: 'POST' })
+    assert.equal(startOperation.status, 202)
+    let { operation } = await startOperation.json()
+    const id = operation.id
+    assert.equal(operation.kind, kind)
+    for (let attempt = 0; operation.phase === 'running' && attempt < 100; attempt++) {
+      await delay(25, undefined, { signal })
+      const response = await get('/api/whyai/operation')
+      assert.equal(response.status, 200)
+      ;({ operation } = await response.json())
+      assert.equal(operation.id, id)
+    }
+    assert.equal(operation.phase, 'succeeded', `fixture ${kind} must settle successfully`)
+    assert.equal(JSON.stringify(operation).includes('must-not-leak'), false)
+  }
 }
 
 async function bootAndProbe(port) {
@@ -177,6 +208,8 @@ async function bootAndProbe(port) {
   let result
   let webStarted = false
   let webDone = false
+  let resolveToolsDone
+  const toolsDone = new Promise(resolve => { resolveToolsDone = resolve })
   const webController = new AbortController()
   const incomplete = (code) => new Error(`dsh boot exited ${code} before probes completed (toolDone=${result !== undefined}, webDone=${webDone}): ${redact(buffer).slice(-2_000)}`)
   const { done, stop } = managedCommand(['--profile', 'web', '--host', '127.0.0.1', '--port', String(port), '--no-open'], {
@@ -191,7 +224,7 @@ async function bootAndProbe(port) {
       const token = buffer.match(/https?:\/\/[^\s]+[?&]token=([^\s]+)/u)?.[1]
       if (token && !webStarted) {
         webStarted = true
-        void probeWeb(port, token, webController.signal).then(() => {
+        void probeWeb(port, token, webController.signal, toolsDone).then(() => {
           if (webController.signal.aborted) return
           webDone = true
           if (result !== undefined) stop()
@@ -205,6 +238,7 @@ async function bootAndProbe(port) {
         stop(new Error(`probe failed: ${probeFailure[1]}`))
       } else if (marker && result === undefined) {
         result = JSON.parse(marker[1])
+        resolveToolsDone()
         if (webDone) stop()
       }
     },
@@ -244,6 +278,7 @@ try {
   const readOnlyCommands = [
     '--version', '--json status', '--json billing access', '--json billing access', '--json billing summary',
   ]
+  const managementCommands = ['--json logout', '--json status', 'login --gateway https://ai.yitang.top', '--json status']
   const checkCommon = (result) => {
     assert.deepEqual(result.schemas, ['yai_conversation_create', 'yai_message_send', 'yai_partners', 'yai_status'])
     assert.equal(result.status.isError, false, result.status.text)
@@ -273,7 +308,7 @@ try {
   const createCommand = '--json conversations create --data -'
   const sendCommand = `--json chat - --conversation ${conversationId}`
   assert.deepEqual(calls.map((call) => call.args.join(' ')).sort(), [
-    ...readOnlyCommands, createCommand, `${sendCommand} --no-memory`, `${sendCommand} --knowledge-base --no-memory`,
+    ...readOnlyCommands, ...managementCommands, createCommand, `${sendCommand} --no-memory`, `${sendCommand} --knowledge-base --no-memory`,
   ].sort())
   const writes = calls.filter((call) => call.args[1] === 'conversations' || call.args[1] === 'chat')
   assert.deepEqual(writes, [
@@ -291,8 +326,8 @@ try {
     assert.match(denied.text, /requires approval|no agent|approval/u)
   }
   // A policy denial must happen before the fixture subprocess is invoked.
-  assert.deepEqual((await readCalls()).map((call) => call.args.join(' ')).sort(), readOnlyCommands.sort())
-  process.stdout.write('真实组合通过：Loader、默认 create/send/repeat send、显式批准拒绝、认证路由、并发缓存、客户端清单与资源\n')
+  assert.deepEqual((await readCalls()).map((call) => call.args.join(' ')).sort(), [...readOnlyCommands, ...managementCommands].sort())
+  process.stdout.write('真实组合通过：Loader、默认 create/send/repeat send、显式批准拒绝、认证与管理路由、fixture 退出/登录、并发缓存、客户端清单与资源\n')
 } finally {
   // A failed cleanup is not quiescence: keep files that surviving work may use.
   if (!preserveHome) await rm(home, { recursive: true, force: true })

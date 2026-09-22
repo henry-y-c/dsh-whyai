@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process'
 import { isAbsolute } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 class Collector {
   constructor(maxBytes) {
@@ -42,7 +43,11 @@ export class NodeSubprocess {
     this.specs.push(spec)
     const stdout = new Collector(spec.stdio.stdout.maxBytes)
     const stderr = new Collector(spec.stdio.stderr.maxBytes)
-    const child = spawn(spec.argv[0], spec.argv.slice(1), {
+    const isWindows = process.platform === 'win32'
+    const isMjs = typeof spec.argv[0] === 'string' && spec.argv[0].endsWith('.mjs')
+    const command = isWindows && isMjs ? process.execPath : spec.argv[0]
+    const args = isWindows && isMjs ? [spec.argv[0], ...spec.argv.slice(1)] : spec.argv.slice(1)
+    const child = spawn(command, args, {
       cwd: spec.cwd,
       env: { ...process.env, ...this.env },
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -94,7 +99,7 @@ export class NodeSubprocess {
 }
 
 export const CONFIG = {
-  cliPath: new URL('./fixtures/mock-whyai.mjs', import.meta.url).pathname,
+  cliPath: fileURLToPath(new URL('./fixtures/mock-whyai.mjs', import.meta.url)),
   timeoutMs: 2_000,
   graceMs: 100,
   stdoutMaxBytes: 8_192,

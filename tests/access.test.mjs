@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { build } from 'esbuild'
+import { fileURLToPath } from 'node:url'
 import { apply } from '../lib/index.js'
 import { CONFIG, fakeContext, NodeSubprocess } from './helpers.mjs'
 
-const bundle = await build({ stdin: { contents: "export * from './src/access.ts'; export * from './src/routes.ts'; export { WhyAiCliError, WhyAiCliRunner } from './src/runner.ts'", resolveDir: new URL('..', import.meta.url).pathname }, bundle: true, write: false, format: 'esm', platform: 'node' })
+const bundle = await build({ stdin: { contents: "export * from './src/access.ts'; export * from './src/routes.ts'; export { WhyAiCliError, WhyAiCliRunner } from './src/runner.ts'", resolveDir: fileURLToPath(new URL('..', import.meta.url)) }, bundle: true, write: false, format: 'esm', platform: 'node' })
 const { WhyAiAccess, installAccessRoute, WhyAiCliError, WhyAiCliRunner } = await import(`data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].text).toString('base64')}`)
 const accessValue = { eligible: true, available_percent: 75, valid_until: '2099-01-01T00:00:00Z' }
 const summaryValue = { plan_source: 'subscription', plan_expires_at: '2099-02-01T00:00:00Z', next_reset_at: '2098-12-15T00:00:00Z' }
@@ -278,4 +279,60 @@ test('host requires only tools/subprocess and registers optional Web injection',
   assert.deepEqual(dependencies, ['webServer', 'connection'])
   assert.equal(harness.tools.size, 4)
   await harness.dispose()
+})
+
+test('invalidate cancels in-flight request and does not repopulate cache with old result', async () => {
+  let release
+  const delayed = new Promise((r) => { release = r })
+  const access = new WhyAiAccess({
+    invoke: async (args) => ok(args.at(-1) === 'access' ? await delayed : summaryValue),
+  })
+  const oldFlight = access.get()
+  await flush()
+  access.invalidate()
+  const freshFlight = access.get(true)
+  assert.equal(freshFlight, oldFlight) // Retain ownership until the cancelled runner settles.
+  release({ eligible: true, available_percent: 42, valid_until: '2099-01-01T00:00:00Z' })
+  assert.deepEqual(await oldFlight, { status: 'error', code: 'WHYAI_CANCELLED' })
+  assert.deepEqual(await freshFlight, { status: 'error', code: 'WHYAI_CANCELLED' })
+  assert.equal((await access.get()).data.available_percent, 42)
+  await access.dispose()
+})
+
+test('fresh requests share active flight and management hides cached identity', async () => {
+  let management = false
+  const delayed = deferred()
+  let calls = 0
+  const access = new WhyAiAccess({ invoke: async args => {
+    calls++
+    return args.at(-1) === 'access' ? await delayed.promise : ok(summaryValue)
+  } }, () => management)
+  const first = access.get()
+  assert.equal(access.get(true), first)
+  await flush(); assert.equal(calls, 1)
+  delayed.resolve(ok(accessValue)); await first
+  management = true
+  assert.deepEqual(await access.get(), { status: 'error', code: 'WHYAI_BUSY' })
+  access.invalidate()
+  management = false
+  await access.dispose()
+})
+
+test('access query parses exact fresh flag and no-cache does not refresh', async () => {
+  let calls = 0
+  const mounted = mount({ invoke: async args => { calls++; return ok(args.at(-1) === 'access' ? accessValue : summaryValue) } })
+  const send = async (url, headers = {}) => {
+    const res = { writeHead(status) { this.status = status }, end(body) { this.body = JSON.parse(body) } }
+    await mounted.route.handler({ method: 'GET', url, headers }, res)
+    return res
+  }
+  await send('/api/whyai/access')
+  await send('/api/whyai/access', { 'cache-control': 'no-cache' })
+  assert.equal(calls, 2)
+  assert.equal((await send('/api/whyai/access?x=fresh=1')).status, 400)
+  assert.equal((await send('/api/whyai/access?fresh=10')).status, 400)
+  assert.equal(calls, 2)
+  await send('/api/whyai/access?fresh=1')
+  assert.equal(calls, 4)
+  await mounted.dispose()
 })

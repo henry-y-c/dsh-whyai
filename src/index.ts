@@ -1,9 +1,13 @@
 import type { PluginContext } from './dsh-types.ts'
+import { WhyAiActions } from './actions.ts'
+import type { WhyAiAccess } from './access.ts'
 import { Config, validateConfig, type WhyAiConfig } from './config.ts'
 import { WhyAiCliRunner } from './runner.ts'
-import { installAccessRoute } from './routes.ts'
+import { installAccessRoute, installActionRoutes } from './routes.ts'
 import { createToolDefinitions, TOOL_NAMES } from './tools.ts'
 
+export { WhyAiActions } from './actions.ts'
+export type { ActionResult, ActionKind, Operation } from './actions.ts'
 export { Config } from './config.ts'
 export type { WhyAiConfig } from './config.ts'
 export { WhyAiCliError, WhyAiCliRunner } from './runner.ts'
@@ -19,7 +23,12 @@ export function apply(ctx: PluginContext, config: WhyAiConfig): void {
   validateConfig(config)
   const runner = new WhyAiCliRunner(ctx.subprocess, config)
   for (const tool of createToolDefinitions(runner, config, ctx.logger)) ctx.tools.register(tool)
-  ctx.inject(['webServer', 'connection'], (webCtx) => installAccessRoute(webCtx, runner))
+  ctx.inject(['webServer', 'connection'], (webCtx) => {
+    const accessRef: { current?: WhyAiAccess } = {}
+    const actions = new WhyAiActions(ctx.subprocess, config, runner, () => accessRef.current?.invalidate())
+    installAccessRoute(webCtx, runner, accessRef, () => actions.busy)
+    installActionRoutes(webCtx, actions)
+  })
 
   if (config.requireApproval) {
     ctx.on('tools/pre-execute', async (exec, next) => {

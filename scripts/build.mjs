@@ -1,15 +1,20 @@
 import { build } from 'esbuild'
 import { rm } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 await rm(resolve(root, 'lib'), { recursive: true, force: true })
-const declarations = spawnSync('npx', ['tsc', '-p', 'tsconfig.json'], {
-  cwd: root,
-  stdio: 'inherit',
-})
+const tscScript = resolve(root, 'node_modules/typescript/bin/tsc')
+const declarations = existsSync(tscScript)
+  ? spawnSync(process.execPath, [tscScript, '-p', 'tsconfig.json'], { cwd: root, stdio: 'inherit' })
+  : spawnSync(process.platform === 'win32' ? 'npx.cmd' : 'npx', ['tsc', '-p', 'tsconfig.json'], {
+      cwd: root,
+      stdio: 'inherit',
+      shell: process.platform === 'win32',
+    })
 if (declarations.status !== 0) process.exit(declarations.status ?? 1)
 
 await build({

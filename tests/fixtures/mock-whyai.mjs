@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { appendFile } from 'node:fs/promises'
+import { appendFile, readFile, writeFile } from 'node:fs/promises'
 
 const args = process.argv.slice(2)
 let stdin = ''
@@ -17,8 +17,22 @@ const fail = (message, code = undefined) => {
 
 if (args.length === 1 && args[0] === '--version') {
   process.stdout.write('0.5.7\n')
+} else if (args.join(' ') === 'login --gateway https://ai.yitang.top') {
+  if (!process.env.MOCK_WHYAI_STATE) throw new Error('management fixture requires isolated state')
+  await writeFile(process.env.MOCK_WHYAI_STATE, 'logged-in')
+  print({ logged_in: true })
+} else if (args.join(' ') === '--json logout') {
+  if (!process.env.MOCK_WHYAI_STATE) throw new Error('management fixture requires isolated state')
+  await writeFile(process.env.MOCK_WHYAI_STATE, 'logged-out')
+  print({ logged_out: true })
 } else if (args.join(' ') === '--json status') {
-  print({ logged_in: true, gateway: 'https://mock.invalid', environment: 'test', user: { id: 'must-not-leak' } })
+  const loggedOut = process.env.MOCK_WHYAI_STATE && await readFile(process.env.MOCK_WHYAI_STATE, 'utf8').catch(() => '') === 'logged-out'
+  if (loggedOut) {
+    print({ logged_in: false })
+    process.exitCode = 1
+  } else {
+    print({ logged_in: true, gateway: 'https://mock.invalid', environment: 'test', user: { id: 'must-not-leak' } })
+  }
 } else if (args.join(' ') === '--json billing access') {
   print({ eligible: true, available_percent: 75, plan_code: 'test', valid_until: '2099-01-01T00:00:00Z' })
 } else if (args.join(' ') === '--json billing summary') {

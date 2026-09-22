@@ -2,206 +2,272 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import vm from 'node:vm'
 import { build } from 'esbuild'
-
+import { fileURLToPath } from 'node:url'
 async function load(entry, overrides = {}) {
-  const { outputFiles } = await build({ entryPoints: [new URL(`../src/client/${entry}.ts`, import.meta.url).pathname], bundle: true, platform: 'browser', format: 'cjs', external: ['react'], write: false })
+  const { outputFiles } = await build({ entryPoints: [fileURLToPath(new URL(`../src/client/${entry}.ts`, import.meta.url))], bundle: true, platform: 'browser', format: 'cjs', external: ['react'], write: false })
   const module = { exports: {} }
-  const context = { module, exports: module.exports, console, AbortController, TextDecoder, Uint8Array, setTimeout, clearTimeout, queueMicrotask, fetch,
-    require: name => { assert.equal(name, 'react'); return { useId: () => 'test-popover', createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }) } }, ...overrides }
-  vm.runInNewContext(outputFiles[0].text, context)
+  vm.runInNewContext(outputFiles[0].text, { module, exports: module.exports, console, AbortController, TextDecoder, Uint8Array, setTimeout, clearTimeout, queueMicrotask, fetch,
+    require: () => ({ useId: () => 'popover-test', createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }) }), ...overrides })
   return module.exports
 }
 const data = { available_percent: 42.25, eligible: true, valid_until: '2026-10-01T00:00:00Z', subscription_expires_at: '2026-11-01T00:00:00Z', next_reset_at: null, billing_status: 'ok' }
-const response = (value = { status: 'ok', data }) => new Response(JSON.stringify(value), { headers: { 'content-type': 'application/json' } })
-const flush = async () => { for (let i = 0; i < 20; i++) await Promise.resolve() }
-function walk(node) { return !node || typeof node !== 'object' ? [] : [node, ...node.children.flatMap(walk)] }
-function text(node) { return typeof node === 'string' ? node : node && typeof node === 'object' ? node.children.map(text).join(' ') : '' }
+const response = value => new Response(JSON.stringify(value))
+const access = () => response({ status: 'ok', data })
+const op = (phase = 'running', kind = 'login') => ({ id: 'test-op', kind, phase })
+const flush = async () => { for (let i = 0; i < 100; i++) await Promise.resolve() }
+function walk(node) { return !node || typeof node !== 'object' ? [] : [node, ...node.children.flat(Infinity).flatMap(walk)] }
+function text(node) { return typeof node === 'string' ? node : node && typeof node === 'object' ? node.children.flat(Infinity).map(text).join(' ') : '' }
 function environment(fetcher) {
   let sequence = 0
-  const timers = new Map(), events = new Set()
-  const document = { hidden: false, addEventListener: (name, fn) => { assert.equal(name, 'visibilitychange'); events.add(fn) }, removeEventListener: (_name, fn) => events.delete(fn) }
-  return { timers, events, document, overrides: { fetch: fetcher, document, setTimeout: (fn, ms) => { const id = ++sequence; timers.set(id, { fn, ms }); return id }, clearTimeout: id => timers.delete(id) },
-    fire(ms) { for (const [id, timer] of [...timers]) if (timer.ms === ms) { timers.delete(id); timer.fn() } },
-    hide(hidden) { document.hidden = hidden; for (const fn of events) fn() } }
+  const timers = new Map(), events = new Set(), calls = []
+  const document = { hidden: false, addEventListener: (_name, fn) => events.add(fn), removeEventListener: (_name, fn) => events.delete(fn) }
+  return { timers, events, calls, overrides: { fetch: (url, init) => { calls.push({ url, init }); return fetcher(url, init) }, document, setTimeout: (fn, ms) => { const id = ++sequence; timers.set(id, { fn, ms }); return id }, clearTimeout: id => timers.delete(id) },
+    fire(ms) { for (const [id, timer] of [...timers]) if (timer.ms === ms) { timers.delete(id); timer.fn() } }, hide(hidden) { document.hidden = hidden; for (const fn of events) fn() } }
 }
+const withOperation = fetcher => (url, init) => url.endsWith('/operation') ? response({ operation: null }) : fetcher(url, init)
 
-test('wire parsing preserves null and zero; rejects malformed and out-of-range values', async () => {
-  const { parseAccess } = await load('store')
+test('wire parsers validate zero, dates, billing and bounded operation fields', async () => {
+  const { parseAccess, parseOperation } = await load('store')
   for (const percent of [null, 0, 100, 12.5]) assert.equal(parseAccess({ status: 'ok', data: { ...data, available_percent: percent } }).available_percent, percent)
-  for (const invalid of [-1, 101, '40', NaN, undefined]) assert.throws(() => parseAccess({ status: 'ok', data: { ...data, available_percent: invalid } }), /invalid/)
-  assert.throws(() => parseAccess({ status: 'ok', data: { ...data, eligible: 'true' } }), /invalid/)
-  assert.throws(() => parseAccess({ status: 'ok', data: { ...data, valid_until: 'secret text' } }), /invalid/)
-  assert.throws(() => parseAccess({ status: 'error', code: 'WHYAI_AUTH_REQUIRED' }), /auth/)
-  assert.throws(() => parseAccess({ status: 'error', code: 'WHYAI_NOT_LOGGED_IN' }), /auth/)
-  assert.throws(() => parseAccess({ status: 'error', code: 'sensitive backend body' }), /unavailable/)
-  assert.throws(() => parseAccess({ status: 'ok', data: { ...data, billing_status: 'invalid' } }), /invalid/)
-  assert.equal(parseAccess({ status: 'ok', data: { ...data, billing_status: 'unavailable' } }).billing_status, 'unavailable')
-  for (const key of ['subscription_expires_at', 'next_reset_at', 'billing_status']) {
-    const missing = { ...data }; delete missing[key]
-    assert.throws(() => parseAccess({ status: 'ok', data: missing }), /invalid/)
-  }
-  assert.throws(() => parseAccess({ status: 'ok', data: { ...data, next_reset_at: 'invalid' } }), /invalid/)
+  for (const invalid of [-1, 101, '40', NaN, undefined]) assert.throws(() => parseAccess({ status: 'ok', data: { ...data, available_percent: invalid } }))
+  for (const key of ['subscription_expires_at', 'next_reset_at', 'billing_status']) { const d = { ...data }; delete d[key]; assert.throws(() => parseAccess({ status: 'ok', data: d })) }
+  assert.equal(parseOperation({ operation: op() }).phase, 'running')
+  for (const patch of [{ id: '../secret' }, { phase: 'done' }, { kind: 'shell' }, { version: '<secret>' }]) assert.throws(() => parseOperation({ operation: { ...op(), ...patch } }))
 })
 
-test('503 CLI authentication errors remain distinguishable without exposing body', async () => {
-  const env = environment(async () => new Response(JSON.stringify({ status: 'error', code: 'WHYAI_NOT_LOGGED_IN' }), { status: 503 }))
-  const { AccessStore } = await load('store', env.overrides)
-  const store = new AccessStore(), off = store.subscribe(() => {})
-  await flush()
-  assert.equal(store.getSnapshot().error, 'auth')
+test('shared ordinary polling retains last-good stale data; auth classes clear it', async () => {
+  for (const [failure, expected, retained] of [
+    [() => { throw Error('private secret') }, 'unavailable', true],
+    [() => new Response('secret', { status: 401 }), 'dshAuth', false],
+    [() => new Response('secret', { status: 403 }), 'forbidden', false],
+    [() => response({ status: 'error', code: 'WHYAI_NOT_LOGGED_IN' }), 'auth', false],
+    [() => response({ status: 'error', code: 'WHYAI_EXECUTABLE_NOT_FOUND' }), 'missing', false],
+  ]) {
+    let reads = 0
+    const env = environment(withOperation(() => ++reads === 1 ? access() : failure()))
+    const { AccessStore } = await load('store', env.overrides)
+    const store = new AccessStore(), off1 = store.subscribe(() => {}), off2 = store.subscribe(() => {})
+    await flush(); assert.equal(reads, 1)
+    env.fire(60_000); await flush()
+    assert.equal(store.getSnapshot().error, expected)
+    assert.equal(!!store.getSnapshot().data, retained)
+    assert.equal(!!store.getSnapshot().stale, retained)
+    assert.ok(env.calls.every(c => !c.url.includes('fresh')))
+    off1(); assert.equal(env.events.size, 1); off2(); await flush()
+    assert.equal(env.events.size, 0); assert.equal(env.timers.size, 0)
+  }
+})
+
+test('actual buttons confirm host intent, prevent duplicate POST, cancel only on terminal and recover remount', async () => {
+  let operation = null, posts = 0, loggedIn = false
+  const env = environment((url, init) => {
+    if (url.endsWith('/operation')) return response({ operation })
+    if (url.includes('/login?')) { posts++; assert.equal(init.method, 'POST'); assert.ok(url.endsWith('confirm=host')); operation = op(); return response({ operation }) }
+    if (url.includes('/cancel?')) return response({ operation })
+    return loggedIn ? access() : response({ status: 'error', code: 'WHYAI_NOT_LOGGED_IN' })
+  })
+  const { AccessStore } = await load('store', env.overrides), { AccessSummary } = await load('summary'), { en } = await load('locales')
+  const store = new AccessStore(); let off = store.subscribe(() => {}); await flush()
+  const actions = { prepare: store.prepare, dismiss: store.dismiss, confirm: store.confirm, cancel: store.cancel, retry: store.retry }
+  const render = () => AccessSummary({ wide: true, t: k => en[k], useAccess: s => s(store.getSnapshot()), actions })
+  const click = label => { const button = walk(render()).find(n => n.type === 'button' && text(n) === label); assert.ok(button, label); return button.props.onClick() }
+  click(en.loginBtn); assert.equal(posts, 0); assert.ok(text(render()).includes(en.loginConfirm))
+  click(en.dismissBtn); assert.equal(store.getSnapshot().confirmation, undefined)
+  click(en.loginBtn); const confirm = walk(render()).find(n => n.type === 'button' && text(n) === en.confirmBtn)
+  confirm.props.onClick(); confirm.props.onClick(); await flush(); assert.equal(posts, 1)
+  click(en.cancelBtn); await flush(); assert.equal(store.getSnapshot().operation.phase, 'running'); assert.equal(store.getSnapshot().cancelRequested, true)
+  assert.ok(text(render()).includes(en.cancelRequested)); assert.ok(!text(render()).includes(en.operationCancelled))
+  off(); assert.equal(env.timers.size, 0)
+  off = store.subscribe(() => {}); await flush(); assert.equal(store.getSnapshot().operation.phase, 'running')
+  operation = op('succeeded'); loggedIn = true; env.fire(2_000); await flush()
+  assert.ok(store.getSnapshot().data); assert.ok(text(render()).includes(en.loginSuccess)); assert.ok(text(render()).includes('42.25%'))
   off()
 })
 
-test('wide summary has accurate progress, eligibility, validity and no fabricated reset', async () => {
-  const { AccessSummary } = await load('summary')
-  const { zh, en } = await load('locales')
-  for (const dictionary of [zh, en]) {
-    const node = AccessSummary({ wide: true, t: key => dictionary[key], useAccess: selector => selector({ loading: false, data }) })
-    assert.match(text(node), /42.25%/)
-    assert.ok(text(node).includes(dictionary.expiry))
-    assert.ok(text(node).includes(dictionary.reset))
-    const progress = walk(node).find(n => n.props.role === 'progressbar')
-    assert.equal(progress.props['aria-valuenow'], 42.25)
+test('failed logout remains failed even when access data recovers; identity invalidates at start', async () => {
+  let operation = null
+  const env = environment(url => url.includes('logout?') ? (operation = op('failed', 'logout'), response({ operation })) : url.endsWith('/operation') ? response({ operation }) : access())
+  const { AccessStore } = await load('store', env.overrides), { AccessSummary } = await load('summary'), { en } = await load('locales')
+  const store = new AccessStore(), off = store.subscribe(() => {}); await flush()
+  store.prepare('logout'); const done = store.confirm(); assert.equal(store.getSnapshot().data, undefined); await done; await flush()
+  const node = AccessSummary({ wide: true, t: k => en[k], useAccess: s => s(store.getSnapshot()), actions: store })
+  assert.ok(text(node).includes(en.logoutFailed)); assert.ok(!text(node).includes(en.logoutSuccess)); assert.ok(store.getSnapshot().data)
+  off()
+})
+
+test('lifecycle abort ignores late POST and recovers host outcome without cancelling it', async () => {
+  let resolve, signal, operation = null
+  const env = environment((url, init) => {
+    if (url.endsWith('/operation')) return response({ operation })
+    if (url.includes('login?')) { signal = init.signal; return new Promise(done => { resolve = done }) }
+    return response({ status: 'error', code: 'WHYAI_NOT_LOGGED_IN' })
+  })
+  const { AccessStore } = await load('store', env.overrides), store = new AccessStore()
+  let off = store.subscribe(() => {}); await flush(); store.prepare('login'); void store.confirm(); off()
+  assert.equal(signal.aborted, true); operation = op(); resolve(response({ operation })); await flush()
+  assert.equal(store.getSnapshot().operation, undefined); assert.equal(env.timers.size, 0)
+  off = store.subscribe(() => {}); await flush(); assert.equal(store.getSnapshot().operation.phase, 'running')
+  assert.ok(!env.calls.some(c => c.url.includes('/cancel'))); off()
+})
+
+test('request deadline bounds stalled body and oversized body is sanitized', async () => {
+  for (const oversized of [false, true]) {
+    let bodyCancelled = false, signal
+    const env = environment(withOperation((_url, init) => { signal = init.signal; return oversized ? new Response('x'.repeat(16385)) : new Response(new ReadableStream({ cancel() { bodyCancelled = true } })) }))
+    const { AccessStore } = await load('store', env.overrides), store = new AccessStore(), off = store.subscribe(() => {})
+    await flush(); if (!oversized) { env.fire(15_000); await flush(); assert.equal(signal.aborted, true); assert.equal(bodyCancelled, true) }
+    assert.equal(store.getSnapshot().error, oversized ? 'invalid' : 'timeout'); off(); assert.equal(env.timers.size, 0)
+  }
+})
+
+test('UI distinguishes recovery actions, stale/error feedback, eligibility and native narrow popover', async () => {
+  const { AccessSummary } = await load('summary'), { en, zh } = await load('locales')
+  const actions = { prepare() {}, dismiss() {}, confirm() {}, cancel() {}, retry() {} }
+  for (const dictionary of [en, zh]) {
+    const render = state => AccessSummary({ wide: true, t: k => dictionary[k], useAccess: s => s(state), actions })
+    for (const error of ['missing', 'auth', 'dshAuth', 'forbidden', 'unavailable']) {
+      const node = render({ loading: false, error })
+      const labels = walk(node).filter(n => n.type === 'button').map(text)
+      assert.equal(labels.includes(dictionary.installBtn), error === 'missing')
+      assert.equal(labels.includes(dictionary.loginBtn), error === 'auth')
+      assert.ok(text(node).includes(dictionary[error]))
+    }
+    const node = render({ loading: false, data: { ...data, eligible: false }, stale: true, error: 'unavailable', operation: op('succeeded') })
+    assert.ok(text(node).includes(dictionary.stale)); assert.ok(text(node).includes(dictionary.loginSuccess))
+    assert.equal(walk(node).find(n => n.props.role === 'progressbar').props['aria-valuenow'], 42.25)
     assert.deepEqual(walk(node).filter(n => n.type === 'time').map(n => n.props.dateTime), [data.subscription_expires_at, data.valid_until])
-    assert.ok(text(node).includes(`${dictionary.reset}： ${dictionary.unknown}`))
-    assert.ok(walk(node).some(n => n.props.title === dictionary.validityHint))
+    const dedup = render({ loading: false, data: { ...data, subscription_expires_at: data.valid_until, available_percent: null } })
+    assert.equal(walk(dedup).filter(n => n.type === 'time').length, 1)
+    assert.equal(walk(dedup).find(n => n.props.role === 'progressbar').props['aria-valuenow'], undefined)
+    assert.ok(!text(dedup).includes(dictionary.accessExpiry)); assert.ok(!text(dedup).includes('0%'))
+    const billing = render({ loading: false, data: { ...data, subscription_expires_at: null, billing_status: 'unavailable' } })
+    assert.ok(text(billing).includes(dictionary.billingUnavailable)); assert.ok(text(billing).includes('42.25%'))
   }
-  const node = AccessSummary({ wide: true, t: key => zh[key], useAccess: selector => selector({ loading: false, data: { ...data, available_percent: null, eligible: false } }) })
-  assert.ok(text(node).includes(zh.ineligible))
-  assert.equal(walk(node).find(n => n.props.role === 'progressbar').props['aria-valuenow'], undefined)
-  assert.ok(!text(node).includes('0%'))
-  const reset = '2026-09-30T12:00:00Z'
-  const withReset = AccessSummary({ wide: true, t: key => zh[key], useAccess: selector => selector({ loading: false, data: { ...data, next_reset_at: reset } }) })
-  assert.ok(walk(withReset).some(n => n.type === 'time' && n.props.dateTime === reset))
-  const sameExpiry = AccessSummary({ wide: true, t: key => zh[key], useAccess: selector => selector({ loading: false, data: { ...data, subscription_expires_at: data.valid_until } }) })
-  assert.equal(walk(sameExpiry).filter(n => n.type === 'time').length, 1)
-  assert.ok(!text(sameExpiry).includes(zh.accessExpiry))
-  assert.ok(!text(sameExpiry).includes(data.valid_until))
-  assert.match(text(sameExpiry), /2026/)
-  const billingFailed = AccessSummary({ wide: true, t: key => zh[key], useAccess: selector => selector({ loading: false, data: { ...data, subscription_expires_at: null, billing_status: 'unavailable' } }) })
-  assert.ok(text(billingFailed).includes(zh.billingUnavailable))
-  assert.ok(text(billingFailed).includes(`${zh.expiry}： ${zh.unknown}`))
-  assert.ok(text(billingFailed).includes(zh.accessExpiry))
-  assert.ok(text(billingFailed).includes('42.25%'))
+  const node = AccessSummary({ wide: false, t: k => en[k], useAccess: s => s({ loading: true }), actions })
+  assert.equal(walk(node).find(n => n.type === 'button').props.popoverTarget, walk(node).find(n => n.props.popover === 'auto').props.id)
 })
 
-test('narrow summary uses native top-layer popover without portals or DOM injection', async () => {
-  const { AccessSummary } = await load('summary')
-  const { zh } = await load('locales')
-  const node = AccessSummary({ wide: false, t: key => zh[key], useAccess: selector => selector({ loading: true }) })
-  const button = walk(node).find(n => n.type === 'button')
-  const popover = walk(node).find(n => n.props.popover === 'auto')
-  assert.equal(button.props.popoverTarget, popover.props.id)
-  assert.ok(button.props['aria-label'].includes(zh.loading))
-  assert.equal(popover.props.style.position, 'fixed')
-})
-
-test('slot routing prefers Usage Monitor stack and restores standalone fallback across HMR', async () => {
-  const { apply, inject } = await load('index')
-  assert.deepEqual([...inject], ['slots', 'locale'])
-  const cleanups = [], callbacks = new Map(), active = new Map(), stores = []
-  let sequence = 0
-  apply({ effect: fn => cleanups.push(fn()), locale: { register: (name, dictionaries) => { assert.equal(name, 'whyai'); assert.equal(dictionaries.zh.brand, 'YAI'); return () => {} } }, slots: {
-    inject: (name, fn) => callbacks.set(name, fn),
-    register: (spec, component) => {
-      const token = ++sequence
-      active.set(spec.name, { token, spec, component })
-      stores.push(spec.inject().hooks.access)
-      return () => { if (active.get(spec.name)?.token === token) active.delete(spec.name) }
-    },
-  } })
-  assert.equal(active.size, 0)
-  const removeFooter = callbacks.get('sidebar.footer.action')()
-  assert.equal(active.get('sidebar.footer.action').spec.order, 110)
-  const firstStore = active.get('sidebar.footer.action').spec.inject().hooks.access
-
-  const removeNested = callbacks.get('sidebar.footer.usage-monitor.after')()
-  assert.equal(active.has('sidebar.footer.action'), false)
-  assert.equal(active.get('sidebar.footer.usage-monitor.after').spec.order, 0)
-  assert.equal(active.get('sidebar.footer.usage-monitor.after').spec.inject().hooks.access, firstStore)
-
-  removeNested()
-  await flush()
-  assert.equal(active.get('sidebar.footer.action').spec.inject().hooks.access, firstStore)
-  const removeNestedAgain = callbacks.get('sidebar.footer.usage-monitor.after')()
-  await flush()
-  assert.equal(active.has('sidebar.footer.action'), false)
-  assert.equal(new Set(stores).size, 1)
-
-  removeFooter()
-  removeNestedAgain()
-  for (const cleanup of cleanups.reverse()) cleanup()
-  await flush()
-  assert.equal(active.size, 0)
-})
-
-test('existing Usage Monitor seat wins without mounting a direct footer entry', async () => {
-  const { apply } = await load('index')
-  const callbacks = new Map(), active = new Map(), cleanups = []
-  apply({ effect: fn => cleanups.push(fn()), locale: { register: () => () => {} }, slots: {
-    inject: (name, fn) => callbacks.set(name, fn),
-    register: spec => { active.set(spec.name, spec); return () => active.delete(spec.name) },
-  } })
-  const removeNested = callbacks.get('sidebar.footer.usage-monitor.after')()
-  const removeFooter = callbacks.get('sidebar.footer.action')()
-  assert.equal(active.has('sidebar.footer.action'), false)
-  assert.equal(active.get('sidebar.footer.usage-monitor.after').id, 'whyai')
-  for (const cleanup of cleanups.reverse()) cleanup()
-  removeFooter(); removeNested(); await flush()
-  assert.equal(active.size, 0)
-})
-
-test('polling is shared, hidden-paused, resumed immediately and cancelled on last unsubscribe', async () => {
-  let calls = 0, signal
-  const env = environment(async (_url, init) => { calls++; signal = init.signal; assert.equal(_url, '/api/whyai/access'); assert.equal(init.method, 'GET'); return response() })
-  const { AccessStore } = await load('store', env.overrides)
-  const store = new AccessStore(), listener = () => {}
-  const off1 = store.subscribe(listener), off2 = store.subscribe(listener)
-  await flush(); assert.equal(calls, 1); assert.equal(store.getSnapshot().data.available_percent, 42.25)
-  assert.equal(env.timers.size, 1)
-  env.fire(60_000); await flush(); assert.equal(calls, 2)
-  env.hide(true); assert.equal(env.timers.size, 0); assert.equal(store.getSnapshot().data, undefined)
-  env.fire(60_000); assert.equal(calls, 2)
-  env.hide(false); await flush(); assert.equal(calls, 3)
-  off1(); assert.equal(env.events.size, 1)
-  off2(); await flush(); assert.equal(env.events.size, 0); assert.equal(env.timers.size, 0)
-  const off3 = store.subscribe(listener); await flush(); assert.equal(calls, 4); off3()
-  assert.equal(signal.aborted, false) // Completed requests have no live cancellation owner.
-})
-
-test('late non-cooperative fetch cannot repopulate unmounted or hidden state', async () => {
-  let resolve, signal
-  const env = environment((_url, init) => { signal = init.signal; return new Promise(done => { resolve = done }) })
-  const { AccessStore } = await load('store', env.overrides)
-  const store = new AccessStore(), off = store.subscribe(() => {})
-  env.hide(true); assert.equal(signal.aborted, true)
-  resolve(response()); await flush(); assert.equal(store.getSnapshot().data, undefined)
-  env.hide(false); off(); assert.equal(signal.aborted, true)
-  resolve(response()); await flush(); assert.equal(store.getSnapshot().data, undefined)
-  assert.equal(env.timers.size, 0); assert.equal(env.events.size, 0)
-})
-
-test('timeout covers stalled body and clears timers; disposal prevents remount', async () => {
-  let signal, bodyCancelled = false
-  const env = environment(async (_url, init) => { signal = init.signal; return new Response(new ReadableStream({ start() {}, cancel() { bodyCancelled = true } })) })
-  const { AccessStore } = await load('store', env.overrides)
-  const store = new AccessStore(); store.subscribe(() => {})
-  await flush(); env.fire(15_000); await flush()
-  assert.equal(signal.aborted, true); assert.equal(bodyCancelled, true); assert.equal(store.getSnapshot().error, 'timeout')
-  store.dispose(); store.subscribe(() => {}); await flush()
-  assert.equal(env.events.size, 0); assert.equal(env.timers.size, 0)
-})
-
-test('HTTP failure and oversized/malformed response clear success data and sanitize errors', async () => {
-  for (const bad of [() => new Response('private secret', { status: 401 }), () => new Response('timeout', { status: 504 }), () => new Response('x'.repeat(16385)), () => response({ status: 'ok', data: { ...data, available_percent: '42' } }), () => { throw new Error('private credential') }]) {
-    let calls = 0
-    const env = environment(async () => ++calls === 1 ? response() : bad())
-    const { AccessStore } = await load('store', env.overrides)
-    const store = new AccessStore(), off = store.subscribe(() => {})
-    await flush(); assert.ok(store.getSnapshot().data)
-    env.fire(60_000); await flush()
-    assert.equal(store.getSnapshot().data, undefined)
-    assert.ok(['auth', 'invalid', 'unavailable', 'timeout'].includes(store.getSnapshot().error))
-    off(); await flush(); assert.equal(env.timers.size, 0)
+test('install and logout buttons require confirmation and keep terminal feedback', async () => {
+  for (const kind of ['install', 'logout']) {
+    let operation = null, posts = 0
+    const env = environment((url, init) => {
+      if (url.endsWith('/operation')) return response({ operation })
+      if (init.method === 'POST') { posts++; assert.equal(url, `/api/whyai/${kind}?confirm=host`); operation = op('succeeded', kind); return response({ operation }) }
+      return kind === 'install' && !operation ? response({ status: 'error', code: 'WHYAI_EXECUTABLE_NOT_FOUND' }) : access()
+    })
+    const { AccessStore } = await load('store', env.overrides), { AccessSummary } = await load('summary'), { en } = await load('locales')
+    const store = new AccessStore(), off = store.subscribe(() => {}); await flush()
+    const render = () => AccessSummary({ wide: true, t: k => en[k], useAccess: s => s(store.getSnapshot()), actions: store })
+    const click = label => walk(render()).find(n => n.type === 'button' && text(n) === label).props.onClick()
+    click(en[`${kind}Btn`]); assert.equal(posts, 0); assert.ok(text(render()).includes(en[`${kind}Confirm`]))
+    click(en.confirmBtn); await flush(); assert.equal(posts, 1); assert.ok(text(render()).includes(en[`${kind}Success`]))
+    off()
   }
+})
+
+test('hidden pending POST with failed recovery leaves an enabled resume action', async () => {
+  let failRecovery = false, resolve
+  const env = environment(url => {
+    if (url.includes('login?')) return new Promise(done => { resolve = done })
+    if (url.endsWith('/operation')) { if (failRecovery) throw Error('offline'); return response({ operation: null }) }
+    return response({ status: 'error', code: 'WHYAI_NOT_LOGGED_IN' })
+  })
+  const { AccessStore } = await load('store', env.overrides), { AccessSummary } = await load('summary'), { en } = await load('locales')
+  const store = new AccessStore(), off = store.subscribe(() => {}); await flush()
+  const render = () => AccessSummary({ wide: true, t: k => en[k], useAccess: s => s(store.getSnapshot()), actions: store })
+  walk(render()).find(n => n.type === 'button' && text(n) === en.loginBtn).props.onClick()
+  walk(render()).find(n => n.type === 'button' && text(n) === en.confirmBtn).props.onClick(); assert.equal(store.getSnapshot().pending, true)
+  env.hide(true); failRecovery = true; env.hide(false); await flush()
+  assert.equal(store.getSnapshot().pending, false); assert.equal(store.getSnapshot().watchPaused, true)
+  const node = AccessSummary({ wide: true, t: k => en[k], useAccess: s => s(store.getSnapshot()), actions: store })
+  const resume = walk(node).find(n => n.type === 'button' && text(n) === en.resumeBtn)
+  assert.equal(resume.props.disabled, false)
+  const before = env.calls.length; failRecovery = false; resume.props.onClick(); await flush(); assert.ok(env.calls.length > before)
+  resolve(response({ operation: op() })); await flush(); assert.equal(store.getSnapshot().operation, undefined)
+  off()
+})
+
+test('hidden unacknowledged cancel permits same-id retry after recovery', async () => {
+  let resolve, cancels = 0
+  const env = environment(url => {
+    if (url.includes('/cancel?')) { cancels++; return cancels === 1 ? new Promise(done => { resolve = done }) : response({ operation: op() }) }
+    return response({ operation: op() })
+  })
+  const { AccessStore } = await load('store', env.overrides), { AccessSummary } = await load('summary'), { en } = await load('locales')
+  const store = new AccessStore(), off = store.subscribe(() => {}); await flush()
+  const cancelButton = () => walk(AccessSummary({ wide: true, t: k => en[k], useAccess: s => s(store.getSnapshot()), actions: store })).find(n => n.type === 'button' && text(n) === en.cancelBtn)
+  cancelButton().props.onClick(); assert.equal(store.getSnapshot().cancelRequested, true)
+  env.hide(true); env.hide(false); await flush()
+  assert.equal(cancelButton().props.disabled, false); cancelButton().props.onClick(); await flush(); assert.equal(cancels, 2)
+  resolve(response({ operation: op('cancelled') })); await flush(); assert.equal(store.getSnapshot().operation.phase, 'running')
+  off()
+})
+
+test('hidden identity and confirmation clear before resumed requests settle', async () => {
+  let block = false, resolve
+  const env = environment(url => block ? new Promise(done => { resolve = done }) : url.endsWith('/operation') ? response({ operation: null }) : access())
+  const { AccessStore } = await load('store', env.overrides), store = new AccessStore(), off = store.subscribe(() => {})
+  await flush(); store.prepare('logout'); assert.equal(store.getSnapshot().confirmation, 'logout')
+  env.hide(true); assert.equal(store.getSnapshot().data, undefined); assert.equal(store.getSnapshot().confirmation, undefined)
+  block = true; env.hide(false); assert.equal(store.getSnapshot().loading, true); assert.equal(store.getSnapshot().data, undefined)
+  await store.confirm(); assert.ok(env.calls.every(c => c.init.method === 'GET'))
+  off(); resolve(response({ operation: null })); await flush(); assert.equal(store.getSnapshot().data, undefined)
+})
+
+test('rejected new start cannot borrow previous terminal success; only a newer operation clears it', async () => {
+  let operation = { ...op('succeeded'), id: 'previous-operation' }
+  const env = environment(url => {
+    if (url.includes('login?')) return response({ status: 'error', code: 'WHYAI_BUSY' })
+    if (url.endsWith('/operation')) return response({ operation })
+    return response({ status: 'error', code: 'WHYAI_NOT_LOGGED_IN' })
+  })
+  const { AccessStore } = await load('store', env.overrides), { AccessSummary } = await load('summary'), { en } = await load('locales')
+  const store = new AccessStore(), off = store.subscribe(() => {}); await flush()
+  const render = () => AccessSummary({ wide: true, t: k => en[k], useAccess: s => s(store.getSnapshot()), actions: store })
+  const click = label => walk(render()).find(n => n.type === 'button' && text(n) === label).props.onClick()
+  click(en.loginBtn); click(en.confirmBtn); await flush()
+  assert.equal(store.getSnapshot().actionError, 'busy'); assert.ok(text(render()).includes(en.busy)); assert.ok(!text(render()).includes(en.loginSuccess))
+  click(en.retryBtn); await flush(); assert.equal(store.getSnapshot().actionError, 'busy'); assert.ok(!text(render()).includes(en.loginSuccess))
+  operation = { ...op('succeeded'), id: 'new-operation' }; click(en.retryBtn); await flush()
+  assert.equal(store.getSnapshot().actionError, undefined); assert.ok(text(render()).includes(en.loginSuccess))
+  off()
+})
+
+test('recovered operation clears observation errors but null recovery retains rejected-start guidance', async () => {
+  let failure = true
+  const env = environment(url => {
+    if (url.includes('login?')) return response({ status: 'error', code: 'WHYAI_INSTALL_CUSTOM_PATH_UNSUPPORTED' })
+    if (url.endsWith('/operation')) return response({ operation: failure ? null : op('succeeded') })
+    return response({ status: 'error', code: 'WHYAI_NOT_LOGGED_IN' })
+  })
+  const { AccessStore } = await load('store', env.overrides), store = new AccessStore(), off = store.subscribe(() => {})
+  await flush(); store.prepare('login'); await store.confirm(); await flush(); assert.equal(store.getSnapshot().actionError, 'customPath')
+  failure = false; store.retry(); await flush(); assert.equal(store.getSnapshot().actionError, undefined)
+  off()
+})
+
+test('operation monitoring is bounded, hidden-paused, resumes and disposal owns all resources', async () => {
+  const env = environment(() => response({ operation: op() }))
+  const { AccessStore } = await load('store', env.overrides), store = new AccessStore(), off = store.subscribe(() => {})
+  await flush()
+  env.hide(true); assert.equal(env.timers.size, 0)
+  const calls = env.calls.length; env.fire(2_000); await flush(); assert.equal(env.calls.length, calls)
+  env.hide(false); await flush()
+  for (let i = 0; i < 179; i++) { env.fire(2_000); await flush() }
+  assert.equal(store.getSnapshot().watchPaused, true); assert.equal(env.timers.size, 0)
+  assert.equal(store.getSnapshot().operation.phase, 'running')
+  store.retry(); await flush(); assert.equal(store.getSnapshot().watchPaused, false); assert.equal(env.timers.size, 1)
+  store.dispose(); off(); store.subscribe(() => {}); assert.equal(env.timers.size, 0); assert.equal(env.events.size, 0)
+})
+
+test('slot routing shares observable and injected action identities through optional slot remount', async () => {
+  const { apply } = await load('index'), callbacks = new Map(), active = new Map(), cleanups = []
+  apply({ effect: fn => cleanups.push(fn()), locale: { register: () => () => {} }, slots: { inject: (name, fn) => callbacks.set(name, fn), register: spec => { active.set(spec.name, spec); return () => active.delete(spec.name) } } })
+  const offFooter = callbacks.get('sidebar.footer.action')(), first = active.get('sidebar.footer.action').inject()
+  const offNested = callbacks.get('sidebar.footer.usage-monitor.after')()
+  assert.equal(active.has('sidebar.footer.action'), false)
+  const nested = active.get('sidebar.footer.usage-monitor.after').inject()
+  assert.equal(nested.hooks.access, first.hooks.access); assert.equal(nested.actions.confirm, first.actions.confirm)
+  offNested(); await flush(); assert.equal(active.get('sidebar.footer.action').inject().hooks.access, first.hooks.access)
+  offFooter(); for (const cleanup of cleanups.reverse()) cleanup(); await flush(); assert.equal(active.size, 0)
 })
