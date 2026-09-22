@@ -291,9 +291,48 @@ test('invalidate cancels in-flight request and does not repopulate cache with ol
   await flush()
   access.invalidate()
   const freshFlight = access.get(true)
-  assert.notEqual(freshFlight, oldFlight)
+  assert.equal(freshFlight, oldFlight) // Retain ownership until the cancelled runner settles.
   release({ eligible: true, available_percent: 42, valid_until: '2099-01-01T00:00:00Z' })
-  await oldFlight.catch(() => {})
-  await freshFlight.catch(() => {})
+  assert.deepEqual(await oldFlight, { status: 'error', code: 'WHYAI_CANCELLED' })
+  assert.deepEqual(await freshFlight, { status: 'error', code: 'WHYAI_CANCELLED' })
+  assert.equal((await access.get()).data.available_percent, 42)
   await access.dispose()
+})
+
+test('fresh requests share active flight and management hides cached identity', async () => {
+  let management = false
+  const delayed = deferred()
+  let calls = 0
+  const access = new WhyAiAccess({ invoke: async args => {
+    calls++
+    return args.at(-1) === 'access' ? await delayed.promise : ok(summaryValue)
+  } }, () => management)
+  const first = access.get()
+  assert.equal(access.get(true), first)
+  await flush(); assert.equal(calls, 1)
+  delayed.resolve(ok(accessValue)); await first
+  management = true
+  assert.deepEqual(await access.get(), { status: 'error', code: 'WHYAI_BUSY' })
+  access.invalidate()
+  management = false
+  await access.dispose()
+})
+
+test('access query parses exact fresh flag and no-cache does not refresh', async () => {
+  let calls = 0
+  const mounted = mount({ invoke: async args => { calls++; return ok(args.at(-1) === 'access' ? accessValue : summaryValue) } })
+  const send = async (url, headers = {}) => {
+    const res = { writeHead(status) { this.status = status }, end(body) { this.body = JSON.parse(body) } }
+    await mounted.route.handler({ method: 'GET', url, headers }, res)
+    return res
+  }
+  await send('/api/whyai/access')
+  await send('/api/whyai/access', { 'cache-control': 'no-cache' })
+  assert.equal(calls, 2)
+  assert.equal((await send('/api/whyai/access?x=fresh=1')).status, 400)
+  assert.equal((await send('/api/whyai/access?fresh=10')).status, 400)
+  assert.equal(calls, 2)
+  await send('/api/whyai/access?fresh=1')
+  assert.equal(calls, 4)
+  await mounted.dispose()
 })

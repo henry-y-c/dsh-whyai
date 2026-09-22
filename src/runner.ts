@@ -1,4 +1,5 @@
 import { homedir } from 'node:os'
+import { open } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { SubprocessHandle, SubprocessRuntime } from './dsh-types.ts'
 import type { WhyAiConfig } from './config.ts'
@@ -20,6 +21,14 @@ export interface RawInvocation {
   exitCode: number
   stdout: string
   stderr: string
+}
+
+export interface RunnerLease {
+  readonly signal: AbortSignal
+  invoke(args: readonly string[], stdin?: string): Promise<CliInvocation>
+  invokeRaw(args: readonly string[], stdin?: string, timeoutMs?: number): Promise<RawInvocation>
+  version(executable?: string): Promise<string>
+  execute(argv: readonly string[], cwd: string): Promise<RawInvocation>
 }
 
 interface Waiter {
@@ -91,6 +100,47 @@ function readComplete(
 }
 
 const DISPOSED = Symbol('WhyAI plugin disposed')
+const TIMED_OUT = Symbol('WhyAI deadline expired')
+const busyError = (): WhyAiCliError => new WhyAiCliError('WhyAI CLI is busy', 'WHYAI_BUSY')
+
+function deadlineMs(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 1 || value > 1_800_000) {
+    throw new WhyAiCliError('Invalid WhyAI operation deadline', 'WHYAI_INVALID_ARGUMENT')
+  }
+  return value
+}
+
+async function launcherText(path: string): Promise<string> {
+  const file = await open(path, 'r')
+  try {
+    if (!(await file.stat()).isFile()) throw new Error('not a file')
+    const buffer = Buffer.alloc(8193)
+    const { bytesRead } = await file.read(buffer, 0, buffer.length, 0)
+    if (bytesRead > 8192) throw new Error('oversized launcher')
+    return buffer.subarray(0, bytesRead).toString('utf8')
+  } finally { await file.close() }
+}
+
+/** Never ask a shell to interpret a Windows launcher or user arguments. */
+async function launchArgv(argv: readonly string[], signal: AbortSignal): Promise<readonly string[]> {
+  const executable = argv[0]
+  if (!executable) throw new WhyAiCliError('Missing executable', 'WHYAI_EXECUTABLE_NOT_FOUND')
+  if (!/\.(?:cmd|bat)$/iu.test(executable)) return argv
+  try {
+    if (!/whyai\.cmd$/iu.test(executable)) throw new Error('unsupported launcher')
+    const sibling = executable.slice(0, -4)
+    const [cmd, js] = await untilAbort(Promise.all([launcherText(executable), launcherText(sibling)]), signal)
+    const escaped = sibling.replace(/%/gu, '%%')
+    const lines = cmd.replace(/\r\n/gu, '\n').trimEnd().split('\n')
+    if (lines.length !== 3 || lines[0] !== '@echo off' || lines[1] !== '@rem YAI CLI managed launcher'
+      || !lines[2]?.startsWith('"') || !/^"[^"\r\n]+" /u.test(lines[2])
+      || lines[2].replace(/^"[^"\r\n]+" /u, '') !== `"${escaped}" %*`
+      || !js.startsWith('#!/usr/bin/env node\n// YAI CLI managed launcher\n')) throw new Error('unsupported launcher')
+    return [process.execPath, sibling, ...argv.slice(1)]
+  } catch {
+    throw new WhyAiCliError('WhyAI Windows launcher is not supported', 'WHYAI_EXECUTABLE_NOT_FOUND')
+  }
+}
 
 export function getStandardCliFallback(): string | undefined {
   const home = homedir()
@@ -103,7 +153,7 @@ export function getStandardCliFallback(): string | undefined {
 
 function abortError(signal: AbortSignal, timeout?: AbortSignal): WhyAiCliError {
   if (signal.aborted && signal.reason === DISPOSED) return new WhyAiCliError('WhyAI plugin was disposed', 'WHYAI_DISPOSED')
-  if (timeout?.aborted && !signal.aborted) return new WhyAiCliError('WhyAI CLI timed out', 'WHYAI_TIMEOUT')
+  if (signal.reason === TIMED_OUT || (timeout?.aborted && !signal.aborted)) return new WhyAiCliError('WhyAI CLI timed out', 'WHYAI_TIMEOUT')
   return new WhyAiCliError('WhyAI CLI was cancelled', 'WHYAI_CANCELLED')
 }
 
@@ -138,7 +188,13 @@ export class WhyAiCliRunner {
   private readonly waiters: Waiter[] = []
   private readonly inFlight = new Set<Promise<void>>()
   private readonly activeHandles = new Set<SubprocessHandle>()
+  private readonly abandonedTasks = new Set<Promise<unknown>>()
   private busy = false
+  private management = false
+
+  get isBusy(): boolean { return this.busy || this.poisoned }
+  get managementBusy(): boolean { return this.management }
+  get isQuiescent(): boolean { return this.activeHandles.size === 0 && this.abandonedTasks.size === 0 }
   // A failed cleanup must never permit another process to overlap an orphan.
   private poisoned = false
 
@@ -149,9 +205,18 @@ export class WhyAiCliRunner {
   ) {}
 
   async invoke(args: readonly string[], stdin: string | undefined, signal: AbortSignal): Promise<CliInvocation> {
-    return this.serialized(signal, async (operationSignal) => {
-      const raw = await this.run(args, stdin, operationSignal)
+    return this.serialized(signal, (operationSignal) => this.invokeOwned(args, stdin, operationSignal))
+  }
+
+  private async invokeOwned(args: readonly string[], stdin: string | undefined, signal: AbortSignal): Promise<CliInvocation> {
+      const raw = await this.run(args, stdin, signal)
       const stdoutValue = raw.stdout ? parseJson(raw.stdout, 'stdout') : undefined
+      // Only status documents exit 1 as a successful logged-out observation.
+      if (raw.exitCode === 1 && raw.stderr === '' && args.length === 2
+        && args[0] === '--json' && args[1] === 'status'
+        && isRecord(stdoutValue) && stdoutValue.logged_in === false && !('error' in stdoutValue)) {
+        return { exitCode: 0, value: stdoutValue, hadWarning: false }
+      }
       const stderrValue = raw.exitCode !== 0 && raw.stderr
         ? parseJson(raw.stderr.split(/\n/u).at(-1) ?? '', 'stderr')
         : undefined
@@ -168,39 +233,46 @@ export class WhyAiCliRunner {
         ...(error === undefined ? {} : { error }),
         hadWarning: raw.exitCode === 0 && raw.stderr.length > 0,
       }
-    })
   }
 
   async version(signal: AbortSignal): Promise<string> {
-    return this.serialized(signal, async (operationSignal) => {
-      const raw = await this.run(['--version'], undefined, operationSignal)
+    return this.serialized(signal, (operationSignal) => this.versionOwned(operationSignal))
+  }
+
+  private async versionOwned(signal: AbortSignal, executable?: string): Promise<string> {
+      const raw = await this.run(['--version'], undefined, signal, this.config.timeoutMs, executable === undefined ? undefined : [executable, '--version'])
       if (raw.exitCode !== 0) throw new WhyAiCliError('WhyAI CLI version check failed', 'WHYAI_COMMAND_FAILED')
       const version = raw.stdout.trim()
       if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u.test(version)) {
         throw new WhyAiCliError('WhyAI CLI returned an invalid version', 'WHYAI_MALFORMED_OUTPUT')
       }
       return version
-    })
   }
 
   async resolveExecutable(signal?: AbortSignal): Promise<string> {
-    const opSignal = signal ?? new AbortController().signal
+    const deadline = new AbortController()
+    const opSignal = AbortSignal.any([signal ?? this.lifetime.signal, this.lifetime.signal, deadline.signal])
+    const timer = setTimeout(() => deadline.abort(TIMED_OUT), this.config.timeoutMs)
     try {
-      return await untilAbort(this.subprocess.resolveExecutable(this.config.cliPath, undefined, opSignal), opSignal)
-    } catch (error) {
-      if (opSignal.aborted) throw error
-      if (this.config.cliPath === 'whyai') {
-        const fallback = getStandardCliFallback()
-        if (fallback) {
-          try {
-            return await untilAbort(this.subprocess.resolveExecutable(fallback, undefined, opSignal), opSignal)
-          } catch {
-            // fallback lookup also failed; fall through to standard error
+      if (opSignal.aborted) throw abortError(opSignal)
+      try {
+        return await untilAbort(this.subprocess.resolveExecutable(this.config.cliPath, undefined, opSignal), opSignal)
+      } catch {
+        if (opSignal.aborted) throw abortError(opSignal)
+        if (this.config.cliPath === 'whyai') {
+          const fallback = getStandardCliFallback()
+          if (fallback) {
+            try {
+              return await untilAbort(this.subprocess.resolveExecutable(fallback, undefined, opSignal), opSignal)
+            } catch {
+              if (opSignal.aborted) throw abortError(opSignal)
+              // Fallback lookup also failed; publish only the redacted error.
+            }
           }
         }
+        throw new WhyAiCliError('WhyAI CLI executable could not be resolved', 'WHYAI_EXECUTABLE_NOT_FOUND')
       }
-      throw new WhyAiCliError('WhyAI CLI executable could not be resolved', 'WHYAI_EXECUTABLE_NOT_FOUND')
-    }
+    } finally { clearTimeout(timer) }
   }
 
   async invokeRaw(
@@ -209,21 +281,78 @@ export class WhyAiCliRunner {
     signal: AbortSignal,
     timeoutMs?: number,
   ): Promise<RawInvocation> {
-    return this.serialized(signal, async (operationSignal) => {
-      if (operationSignal.aborted) throw abortError(signal)
-      const effectiveTimeout = timeoutMs ?? this.config.timeoutMs
-      const timeout = new AbortController()
-      const timer = setTimeout(() => timeout.abort(), effectiveTimeout)
-      try {
-        return await this.runWithDeadline(args, stdin, operationSignal, timeout.signal)
-      } finally {
-        clearTimeout(timer)
-      }
-    })
+    return this.serialized(signal, (operationSignal) => this.run(args, stdin, operationSignal, timeoutMs))
   }
 
-  async runTask<T>(signal: AbortSignal, task: (operationSignal: AbortSignal) => Promise<T>): Promise<T> {
-    return this.serialized(signal, task)
+  async runTask<T>(signal: AbortSignal, task: (lease: RunnerLease) => Promise<T>, timeoutMs = 180_000): Promise<T> {
+    const duration = deadlineMs(timeoutMs)
+    const controller = new AbortController()
+    const operationSignal = AbortSignal.any([signal, this.lifetime.signal, controller.signal])
+    if (operationSignal.aborted) throw abortError(operationSignal)
+    if (this.isBusy) throw busyError()
+    // Admission is synchronous: management never queues behind a consultation.
+    this.busy = true
+    this.management = true
+    const release = this.releaseFactory()
+    const timer = setTimeout(() => controller.abort(TIMED_OUT), duration)
+    let closed = false
+    let pending: Promise<unknown> | undefined
+    const owned = <R>(operation: () => Promise<R>): Promise<R> => {
+      if (closed || operationSignal.aborted) return Promise.reject(abortError(operationSignal))
+      if (this.poisoned) return Promise.reject(new WhyAiCliError('WhyAI CLI runner is unavailable after a process cleanup failure', 'WHYAI_PROCESS_FAILED'))
+      if (pending) return Promise.reject(busyError())
+      const result = operation()
+      pending = result
+      void result.then(() => { if (pending === result) pending = undefined }, () => { if (pending === result) pending = undefined })
+      return result
+    }
+    const lease: RunnerLease = {
+      signal: operationSignal,
+      invoke: (args, stdin) => owned(() => this.invokeOwned(args, stdin, operationSignal)),
+      invokeRaw: (args, stdin, timeout) => owned(() => this.run(args, stdin, operationSignal, timeout)),
+      version: (executable) => owned(() => this.versionOwned(operationSignal, executable)),
+      execute: (argv, cwd) => owned(() => this.run([], undefined, operationSignal, duration, argv, cwd)),
+    }
+    const callback = Promise.resolve().then(() => task(lease)).then(
+      value => ({ value }), error => ({ error }),
+    )
+    const work = (async () => {
+      try {
+        // Preserve task errors; cancellation races only the callback, never cleanup.
+        const result = await untilAbort(callback, operationSignal)
+        if (operationSignal.aborted) throw abortError(operationSignal)
+        if ('error' in result) throw result.error
+        return result.value
+      } catch (error) {
+        if (operationSignal.aborted) throw abortError(operationSignal)
+        throw error
+      } finally {
+        closed = true
+        controller.abort()
+        // Also own calls a callback started but neglected to await.
+        if (pending) await pending.catch(() => undefined)
+        try {
+          await this.settleCallback(callback)
+        } catch {
+          this.poisoned = true
+          this.abandonedTasks.add(callback)
+          void callback.then(() => this.abandonedTasks.delete(callback))
+        }
+        clearTimeout(timer)
+        this.management = false
+        release()
+        if (this.poisoned) throw new WhyAiCliError('WhyAI CLI process cleanup failed', 'WHYAI_PROCESS_FAILED')
+      }
+    })()
+    const tracked = work.then(() => undefined, () => undefined)
+    this.inFlight.add(tracked)
+    try { return await work } finally { this.inFlight.delete(tracked) }
+  }
+
+  private async settleCallback(callback: Promise<unknown>): Promise<void> {
+    const deadline = new AbortController()
+    const timer = setTimeout(() => deadline.abort(), this.config.graceMs * 3)
+    try { await untilAbort(callback, deadline.signal) } finally { clearTimeout(timer) }
   }
 
   async dispose(): Promise<void> {
@@ -235,6 +364,11 @@ export class WhyAiCliRunner {
         await this.stop(handle)
       } catch (error: unknown) {
         cleanupErrors.push(error)
+      }
+    }
+    for (const callback of [...this.abandonedTasks]) {
+      try { await this.settleCallback(callback) } catch {
+        cleanupErrors.push(new WhyAiCliError('WhyAI task did not settle within its shutdown deadline', 'WHYAI_PROCESS_FAILED'))
       }
     }
     if (cleanupErrors.length > 0) throw new AggregateError(cleanupErrors, 'WhyAI CLI process cleanup failed')
@@ -274,6 +408,7 @@ export class WhyAiCliRunner {
 
   private acquire(signal: AbortSignal): Promise<() => void> {
     if (signal.aborted) return Promise.reject(abortError(signal))
+    if (this.management) return Promise.reject(busyError())
     if (this.poisoned) return Promise.reject(new WhyAiCliError('WhyAI CLI runner is unavailable after a process cleanup failure', 'WHYAI_PROCESS_FAILED'))
     if (!this.busy) {
       this.busy = true
@@ -318,22 +453,25 @@ export class WhyAiCliRunner {
     }
   }
 
-  private async run(args: readonly string[], stdin: string | undefined, signal: AbortSignal): Promise<RawInvocation> {
+  private async run(args: readonly string[], stdin: string | undefined, signal: AbortSignal, timeoutMs = this.config.timeoutMs, argv?: readonly string[], cwd = this.cwd): Promise<RawInvocation> {
     if (signal.aborted) throw abortError(signal)
+    if (stdin !== undefined && Buffer.byteLength(stdin, 'utf8') > this.config.promptMaxBytes) {
+      throw new WhyAiCliError('WhyAI stdin exceeds its byte limit', 'WHYAI_INPUT_OVERFLOW')
+    }
     const timeout = new AbortController()
-    const timer = setTimeout(() => timeout.abort(), this.config.timeoutMs)
+    const timer = setTimeout(() => timeout.abort(), deadlineMs(timeoutMs))
     try {
-      return await this.runWithDeadline(args, stdin, signal, timeout.signal)
+      return await this.runWithDeadline(args, stdin, signal, timeout.signal, argv, cwd)
     } finally {
       clearTimeout(timer)
     }
   }
 
-  private async runWithDeadline(args: readonly string[], stdin: string | undefined, signal: AbortSignal, timeout: AbortSignal): Promise<RawInvocation> {
+  private async runWithDeadline(args: readonly string[], stdin: string | undefined, signal: AbortSignal, timeout: AbortSignal, fixedArgv?: readonly string[], cwd = this.cwd): Promise<RawInvocation> {
     const operationSignal = AbortSignal.any([signal, timeout])
-    let executable: string
+    let argv: readonly string[]
     try {
-      executable = await this.resolveExecutable(operationSignal)
+      argv = await launchArgv(fixedArgv ?? [await this.resolveExecutable(operationSignal), ...args], operationSignal)
     } catch {
       if (operationSignal.aborted) throw abortError(signal, timeout)
       throw new WhyAiCliError('WhyAI CLI executable could not be resolved', 'WHYAI_EXECUTABLE_NOT_FOUND')
@@ -343,8 +481,8 @@ export class WhyAiCliRunner {
     let handle
     try {
       handle = this.subprocess.spawn({
-        argv: [executable, ...args],
-        cwd: this.cwd,
+        argv,
+        cwd,
         stdio: {
           stdin: stdin === undefined ? 'ignore' : { data: stdin },
           stdout: { maxBytes: this.config.stdoutMaxBytes },

@@ -1,6 +1,12 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { WhyAiCliError, WhyAiCliRunner } from '../lib/index.js'
+import { build } from 'esbuild'
+import { mkdtemp, writeFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+const source = await build({ entryPoints: [fileURLToPath(new URL('../src/runner.ts', import.meta.url))], bundle: true, write: false, platform: 'node', format: 'esm' })
+const { WhyAiCliError, WhyAiCliRunner } = await import(`data:text/javascript;base64,${Buffer.from(source.outputFiles[0].text).toString('base64')}`)
 import { CONFIG, NodeSubprocess } from './helpers.mjs'
 
 const liveSignal = () => new AbortController().signal
@@ -201,6 +207,182 @@ function memoryHandle(overrides = {}) {
 }
 
 const fastConfig = { ...CONFIG, timeoutMs: 30, graceMs: 10 }
+
+function memoryRuntime(handle = memoryHandle()) {
+  return { specs: [], async resolveExecutable(path) { return path }, spawn(spec) { this.specs.push(spec); return handle } }
+}
+
+test('exclusive lease admits immediately, rejects management and consultation overlap', async () => {
+  const hold = deferred()
+  const runtime = memoryRuntime()
+  const runner = new WhyAiCliRunner(runtime, fastConfig)
+  const task = runner.runTask(liveSignal(), async lease => {
+    assert.equal(await lease.version(), '0.5.7')
+    await hold.promise
+    assert.equal(await lease.version('/exact/installed/whyai'), '0.5.7')
+  })
+  assert.equal(runner.isBusy, true)
+  assert.equal(runner.managementBusy, true)
+  await assert.rejects(runner.runTask(liveSignal(), async () => {}), { code: 'WHYAI_BUSY' })
+  await assert.rejects(runner.version(liveSignal()), { code: 'WHYAI_BUSY' })
+  hold.resolve()
+  await task
+  assert.equal(runtime.specs[1].argv[0], '/exact/installed/whyai')
+  assert.equal(runner.managementBusy, false)
+  assert.equal(runner.isBusy, false)
+  assert.equal(runner.isQuiescent, true)
+  await runner.dispose()
+})
+
+test('management cannot queue behind consultation and lease calls cannot reenter', async () => {
+  const done = deferred()
+  const runtime = memoryRuntime(memoryHandle({ done: done.promise }))
+  const runner = new WhyAiCliRunner(runtime, CONFIG)
+  const consult = runner.version(liveSignal())
+  await assert.rejects(runner.runTask(liveSignal(), async () => {}), { code: 'WHYAI_BUSY' })
+  done.resolve({ exitCode: 0, signal: null })
+  await consult
+  await runner.runTask(liveSignal(), async lease => {
+    const first = lease.version()
+    await assert.rejects(lease.version(), { code: 'WHYAI_BUSY' })
+    await first
+  })
+  await runner.dispose()
+})
+
+test('task deadline/disposal bounds stalled callbacks and revoked leases never spawn', async () => {
+  for (const dispose of [false, true]) {
+    const runtime = memoryRuntime()
+    const runner = new WhyAiCliRunner(runtime, fastConfig)
+    const entered = deferred()
+    const late = deferred()
+    let saved
+    const task = runner.runTask(liveSignal(), async lease => { saved = lease; entered.resolve(); return late.promise }, 20)
+    const rejected = assert.rejects(task, { code: 'WHYAI_PROCESS_FAILED' })
+    await entered.promise
+    if (dispose) await bounded(assert.rejects(runner.dispose(), /cleanup failed/u))
+    await bounded(rejected)
+    assert.equal(runner.isBusy, true)
+    assert.equal(runner.isQuiescent, false)
+    await assert.rejects(saved.version())
+    assert.equal(runtime.specs.length, 0)
+    late.reject(new Error('private late callback failure'))
+    await runner.dispose()
+  }
+})
+
+test('cooperative deadline waits for callback finally cleanup without poisoning', async () => {
+  const runner = new WhyAiCliRunner(memoryRuntime(), { ...fastConfig, graceMs: 30 })
+  let cleaned = false
+  await bounded(assert.rejects(runner.runTask(liveSignal(), async lease => {
+    try {
+      await new Promise(resolve => lease.signal.addEventListener('abort', resolve, { once: true }))
+    } finally {
+      await delay(10)
+      cleaned = true
+    }
+  }, 10), { code: 'WHYAI_TIMEOUT' }))
+  assert.equal(cleaned, true)
+  assert.equal(runner.isBusy, false)
+  assert.equal(runner.isQuiescent, true)
+  await runner.dispose()
+})
+
+test('lease owns forgotten installer execution until shutdown and retains poison', async () => {
+  const entered = deferred()
+  let quiet = false
+  const runtime = memoryRuntime(memoryHandle({ done: new Promise(() => {}), waitForExit: async () => quiet }))
+  const original = runtime.spawn
+  runtime.spawn = function(spec) { entered.resolve(); return original.call(this, spec) }
+  const runner = new WhyAiCliRunner(runtime, fastConfig)
+  await bounded(assert.rejects(runner.runTask(liveSignal(), async lease => {
+    void lease.execute(['/fixed/node', '/fixed/install.mjs'], '/fixed/cwd').catch(() => {})
+    await entered.promise
+  }), { code: 'WHYAI_PROCESS_FAILED' }))
+  assert.equal(runtime.specs[0].cwd, '/fixed/cwd')
+  assert.deepEqual(runtime.specs[0].argv, ['/fixed/node', '/fixed/install.mjs'])
+  assert.equal(runner.isQuiescent, false)
+  assert.equal(runner.isBusy, true)
+  await assert.rejects(runner.runTask(liveSignal(), async () => {}), { code: 'WHYAI_BUSY' })
+  quiet = true
+  await runner.dispose()
+  assert.equal(runner.isQuiescent, true)
+})
+
+test('status exit one logged-out exception is command specific and logout JSON is retained', async () => {
+  const make = (text, exitCode = 1, stderr = '') => new WhyAiCliRunner(memoryRuntime(memoryHandle({
+    done: Promise.resolve({ exitCode, signal: null }),
+    collected: { stdout: { readFrom: () => ({ text, lossy: false }) }, stderr: { readFrom: () => ({ text: stderr, lossy: false }) } },
+  })), fastConfig)
+  const runner = make('{"logged_in":false}')
+  assert.deepEqual(await runner.invoke(['--json', 'status'], undefined, liveSignal()), { exitCode: 0, value: { logged_in: false }, hadWarning: false })
+  await assert.rejects(runner.invoke(['--json', 'logout'], undefined, liveSignal()), { code: 'WHYAI_PROCESS_FAILED' })
+  await runner.dispose()
+  for (const [text, code, stderr] of [['{"logged_in":true}', 1, ''], ['{"logged_in":false}', 2, ''], ['{"logged_in":false}', 1, 'warning'], ['{"logged_in":false,"error":{}}', 1, '']]) {
+    const invalid = make(text, code, stderr)
+    await assert.rejects(invalid.invoke(['--json', 'status'], undefined, liveSignal()))
+    await invalid.dispose()
+  }
+  const logout = make('{"logged_out":true}', 0)
+  assert.deepEqual((await logout.runTask(liveSignal(), lease => lease.invoke(['--json', 'logout']))).value, { logged_out: true })
+  await logout.dispose()
+})
+
+test('lease cancellation holds admission until process range is actually quiet', async () => {
+  const done = deferred()
+  const stopped = deferred()
+  const quiet = deferred()
+  const controller = new AbortController()
+  const runtime = memoryRuntime(memoryHandle({ done: done.promise, terminate() { stopped.resolve() }, waitForExit: () => quiet.promise }))
+  const runner = new WhyAiCliRunner(runtime, CONFIG)
+  const task = runner.runTask(controller.signal, lease => lease.execute(['/fixed/node'], '/fixed/cwd'))
+  const rejected = assert.rejects(task, { code: 'WHYAI_CANCELLED' })
+  await delay(0)
+  controller.abort()
+  await stopped.promise
+  assert.equal(runner.managementBusy, true)
+  assert.equal(runner.isQuiescent, false)
+  await assert.rejects(runner.runTask(liveSignal(), async () => {}), { code: 'WHYAI_BUSY' })
+  quiet.resolve(true)
+  await rejected
+  assert.equal(runner.isBusy, false)
+  assert.equal(runner.isQuiescent, true)
+  done.reject(new Error('late provider outcome'))
+  await runner.dispose()
+})
+
+test('lease raw timeout and stdin byte bounds include exact multibyte boundary', async () => {
+  const runtime = memoryRuntime()
+  const runner = new WhyAiCliRunner(runtime, { ...fastConfig, promptMaxBytes: 4 })
+  await runner.runTask(liveSignal(), async lease => {
+    await lease.invokeRaw(['status'], 'éé')
+    await assert.rejects(lease.invokeRaw(['status'], 'ééa'), { code: 'WHYAI_INPUT_OVERFLOW' })
+    await assert.rejects(lease.invokeRaw(['status'], undefined, Infinity), { code: 'WHYAI_INVALID_ARGUMENT' })
+  })
+  assert.equal(runtime.specs.length, 1)
+  assert.deepEqual(runtime.specs[0].stdio.stdin, { data: 'éé' })
+  await runner.dispose()
+  const stalled = new WhyAiCliRunner(memoryRuntime(memoryHandle({ done: new Promise(() => {}) })), fastConfig)
+  await bounded(assert.rejects(stalled.runTask(liveSignal(), lease => lease.invokeRaw(['status'], undefined, 10)), { code: 'WHYAI_TIMEOUT' }))
+  assert.equal(stalled.isQuiescent, true)
+  await stalled.dispose()
+})
+
+test('official Windows cmd maps to Node sibling without shell interpretation', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'whyai-runner-'))
+  const sibling = join(directory, 'whyai')
+  const runtime = memoryRuntime()
+  const runner = new WhyAiCliRunner(runtime, fastConfig)
+  try {
+    await writeFile(sibling, '#!/usr/bin/env node\n// YAI CLI managed launcher\n')
+    await writeFile(`${sibling}.cmd`, `@echo off\r\n@rem YAI CLI managed launcher\r\n"some node.exe" "${sibling.replace(/%/g, '%%')}" %*\r\n`)
+    await runner.runTask(liveSignal(), lease => lease.version(`${sibling}.cmd`))
+    assert.deepEqual(runtime.specs[0].argv, [process.execPath, sibling, '--version'])
+    await writeFile(`${sibling}.cmd`, '@echo off\necho arbitrary command')
+    await assert.rejects(runner.runTask(liveSignal(), lease => lease.version(`${sibling}.cmd`)), { code: 'WHYAI_EXECUTABLE_NOT_FOUND' })
+    assert.equal(runtime.specs.length, 1)
+  } finally { await runner.dispose(); await rm(directory, { recursive: true, force: true }) }
+})
 
 test('uncooperative cleanup is bounded, retains ownership and rejects queued and future work', async () => {
   const stalled = deferred()

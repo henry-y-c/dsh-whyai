@@ -19,7 +19,7 @@ export function apply(ctx: ClientContext): void {
   let removeDirect: (() => void) | undefined
   const register = (name: AccessSlotName, order: number) => ctx.slots.register({
     name, id: 'whyai', order, locale: 'whyai',
-    inject: () => ({ hooks: { access } }),
+    inject: () => ({ hooks: { access }, actions: { prepare: access.prepare, dismiss: access.dismiss, confirm: access.confirm, cancel: access.cancel, retry: access.retry } }),
   }, AccessSummary)
   const mountDirect = (): void => {
     if (!disposed && footerLive && !nestedLive && removeDirect === undefined) {

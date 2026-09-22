@@ -15,7 +15,7 @@
 
 ## 文档与发布治理
 
-- **严禁在未经用户明确直接指令的情况下执行 npm 发布、创建版本 tag 或发布 GitHub Release**。日常迭代、功能开发、Bug 修复与 PR 审查仅停留在本地分支与测试验证阶段；未收到用户的明确“发布”指令前，绝对不要发布新版本。
+- **未经用户明确授权，不决定或升级版本号，不创建版本 tag，不执行 npm 发布或 GitHub Release**。功能开发与 PR 审查记录在“未发布”；提交、推送与合并依各自授权执行，获准合并不等于获准发版。此约束同样适用于受委派的后续 Agent。
 - 项目面向 GitHub 开源和 npm 公开发布；README、贡献指南、安全策略、行为准则、发布流程、变更记录和 GitHub 模板均使用中文维护。
 - `LICENSE` 保留 MIT 官方英文法律文本；协议字段、命令名和模型接口中的英文不为形式上的中文化而改写。
 - 不伪造仓库 URL、作者、联系方式、发布日期或发布状态。提交、tag、npm 发布、profile 安装、服务重启和运行验收分别记录。
@@ -28,7 +28,9 @@
 - 工具名：只在 `src/tools.ts` 的 `TOOL_NAMES` 定义；approval gate 从该常量读取。
 - DSH 升级后核对 tools、subprocess、approval、webServer/connection、客户端 ModuleLoader、locale、sidebar.footer.action 与 async disposer 契约，再构建。
 - 上游核对基线：`0.1.5-rc.2` / `fb2c4b9e698e30edb738bca4cf0618587db7d203`。主 UI 默认用 `sidebar.footer.action` list/root；若 `dsh-usage-monitor` 声明 `sidebar.footer.usage-monitor.after`，则自动迁入其 list/root 子槽，子槽消失后微任务恢复官方槽。两处 owner 都是 `wide: boolean`；窄栏用原生 top-layer popover，不注入 DOM。
-- `GET /api/whyai/access` 先认证后工作；access投影 eligible/available_percent/valid_until，summary投影 subscription_expires_at/next_reset_at 与读取状态。与工具共用一个 runner；30 秒缓存、singleflight、10 秒取消期限（含排队），请求与卸载按上述有界回收契约等待 runner，失败不得冒充静默。
+- `GET /api/whyai/access` 先认证后工作；access投影 eligible/available_percent/valid_until，summary投影 subscription_expires_at/next_reset_at 与读取状态。与工具共用一个 runner；30 秒缓存、singleflight、10 秒取消期限（含排队），强制刷新仍合并在途请求；身份失效取消旧代次并保留清理所有权。
+- 管理操作通过 runner 独占租约调用非重入命令；禁止持锁回调再调用外层串行方法。管理忙碌、取消、静默与终态分别处理，操作开始与任何终态均失效身份缓存。`tests/actions.test.mjs` 必须使用真实 runner 验证锁，不能只用绕过锁的 fakeRunner；隔离组合验证认证操作路由及 fixture 登录/退出。
+- Windows `.cmd` 可被解析不等于能由 CreateProcessW 执行；只识别官方受管 wrapper 并用 Node 执行相邻 JS，不拼接 shell。模拟测试不代表 Windows 原生验收。
 - 订阅到期只取 summary.plan_expires_at（subscription 来源），重置只取 summary.next_reset_at；valid_until 作为独立 CLI 权益有效期，不作订阅兜底，不从 grants.expires_at 推算重置。summary缺失或失败不能抹掉独立access事实，失败须标明账单日期暂不可用。
 
 ## 验证
