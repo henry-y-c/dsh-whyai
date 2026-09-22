@@ -4,7 +4,7 @@
 
 公开目标：[GitHub · henry-y-c/dsh-whyai](https://github.com/henry-y-c/dsh-whyai) · [npm · dsh-whyai](https://www.npmjs.com/package/dsh-whyai)。当前发布与真人验收状态见 [README](README.md)。
 
-## 未发布
+## 0.4.0
 
 ### 新增
 

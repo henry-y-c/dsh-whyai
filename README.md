@@ -4,7 +4,7 @@
 >
 > 能力来自 YAI，边界留在 `dsh-whyai`：四个受限工具，把 Partner 搜索、会话创建和消息发送纳入可批准、可取消、可审计的 DSH 调用链。
 
-`dsh-whyai` 是一个第三方、非官方、同时提供 Host 工具与中文 Web 侧栏的 DeepSeek Harness 插件。当前版本为 **0.3.1**。
+`dsh-whyai` 是一个第三方、非官方、同时提供 Host 工具与中文 Web 侧栏的 DeepSeek Harness 插件。当前版本为 **0.4.0**。
 
 [GitHub · henry-y-c/dsh-whyai](https://github.com/henry-y-c/dsh-whyai) · [npm · dsh-whyai](https://www.npmjs.com/package/dsh-whyai)。可用版本以 npm registry 和 GitHub Releases 实际记录为准。
 
@@ -53,10 +53,10 @@
 中文 YAI 摘要位于侧栏工作区下方、设置入口上方，无需打开设置页。宽栏展示剩余额度进度、CLI 访问资格、当前订阅到期与额度重置时间；窄栏点击 YAI 按钮打开原生顶层浮层，避免被侧栏裁剪。组件使用宿主主题变量与官方插槽，不注入或替换宿主 DOM。
 
 卡片底部提供了『安装』与『登录』快捷操作：
-- **安装**：在未安装 WhyAI CLI 或需要安装时，一键执行官方安装脚本（Windows 系统执行 PowerShell 脚本，macOS / Linux 系统执行 Shell 脚本），安装后自动将 WhyAI 可执行目录加入运行 PATH 并更新版本。
-- **登录**：执行 `whyai login --gateway https://ai.yitang.top` 与 `whyai billing access` 进行账号授权登录，授权完成后显示“获取数据”并自动刷新展示内容。
-- **后台刷新与数据保持**：已登录有数据时，刷新过程在后台静默完成，不闪烁操作按钮；本地持久化缓存保证首屏秒开。
-- **退出授权**：数据卡片右下角提供『退出』按钮，点击后调用 `whyai logout` 注销会话并清理本地授权凭据，平滑恢复至未登录状态。
+- **安装**：在未安装 WhyAI CLI 时提供一键安装，通过受管子进程安全拉取并执行官方安装器，安装后自动适配标准安装路径（macOS/Linux: `~/.local/bin/whyai`，Windows: `%LOCALAPPDATA%\WhyAI\bin`），无须改写全局环境 PATH。
+- **登录**：受管拉起 `whyai login --gateway https://ai.yitang.top` 进行账号授权登录，登录完成后二次校验登录状态，并自动刷新展示最新配额。
+- **后台平滑刷新**：后台轮询在内存中保持平滑过渡，无白屏或骨架屏闪烁；移除持久化 `localStorage`，采用内存状态代次与严格请求取消机制，确保账号切换时无旧数据回灌。
+- **退出授权**：数据卡片右下角提供『退出』按钮，点击后调用官方 `whyai logout` 注销会话并清理凭据，平滑恢复至未登录状态。
 
 若同时安装 `dsh-usage-monitor` 0.4.0 或更高版本，YAI 会自动迁入它声明的 `sidebar.footer.usage-monitor.after` 可选子插槽，使两个完整卡片在宽栏上下排列、在窄栏纵向排列两个入口；该子插槽消失时会恢复到官方 `sidebar.footer.action`，因此两个插件没有运行时依赖、加载顺序要求或单独安装限制。
 
@@ -143,7 +143,7 @@ dsh plugin --profile web add file:/absolute/path/to/dsh-whyai
 从 [npm 版本列表](https://www.npmjs.com/package/dsh-whyai?activeTab=versions) 确认可用版本后，使用明确版本安装：
 
 ```sh
-dsh plugin --profile web add dsh-whyai@0.3.1
+dsh plugin --profile web add dsh-whyai@0.4.0
 ```
 
 安装、重启和运行验收是三个独立步骤。把 bundle 加入正式 profile 后需要重启对应 DSH 服务；不要在承载当前会话的进程内直接重启。
