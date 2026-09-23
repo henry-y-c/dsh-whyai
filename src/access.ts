@@ -61,7 +61,11 @@ export class WhyAiAccess {
   private cache?: { result: AccessResult; expires: number }
   private flight?: { promise: Promise<AccessResult>; cancel: () => void }
 
-  constructor(private readonly runner: Pick<WhyAiCliRunner, 'invoke'>, private readonly managementBusy: () => boolean = () => false) {}
+  constructor(
+    private readonly runner: Pick<WhyAiCliRunner, 'invoke'>,
+    private readonly managementBusy: () => boolean = () => false,
+    private readonly timeoutMs = 30_000,
+  ) {}
 
   invalidate(): void {
     this.cache = undefined
@@ -96,7 +100,7 @@ export class WhyAiAccess {
     const timer = setTimeout(() => {
       cancellation = 'WHYAI_TIMEOUT'
       controller.abort()
-    }, 10_000)
+    }, this.timeoutMs)
     this.flight = { promise, cancel: () => {
       cancellation = 'WHYAI_DISPOSED'
       clearTimeout(timer)

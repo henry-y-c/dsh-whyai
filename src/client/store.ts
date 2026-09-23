@@ -127,7 +127,7 @@ export class AccessStore implements Observable<AccessState> {
     const cancel = (reason = 'unavailable') => { reject(new Error(reason)); controller.abort() }
     const dispose = () => cancel()
     this.#requests.add(dispose)
-    const timeout = setTimeout(() => cancel('timeout'), 15_000)
+    const timeout = setTimeout(() => cancel('timeout'), 35_000)
     const work = (async () => readBody(await fetch(`/api/whyai/${path}`, { method, credentials: 'same-origin', cache: 'no-store', headers: { accept: 'application/json' }, signal: controller.signal }), controller.signal))()
     try { return await Promise.race([work, cancelled]) }
     finally { clearTimeout(timeout); this.#requests.delete(dispose) }

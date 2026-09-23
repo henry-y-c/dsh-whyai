@@ -115,7 +115,7 @@ test('request deadline bounds stalled body and oversized body is sanitized', asy
     let bodyCancelled = false, signal
     const env = environment(withOperation((_url, init) => { signal = init.signal; return oversized ? new Response('x'.repeat(16385)) : new Response(new ReadableStream({ cancel() { bodyCancelled = true } })) }))
     const { AccessStore } = await load('store', env.overrides), store = new AccessStore(), off = store.subscribe(() => {})
-    await flush(); if (!oversized) { env.fire(15_000); await flush(); assert.equal(signal.aborted, true); assert.equal(bodyCancelled, true) }
+    await flush(); if (!oversized) { env.fire(35_000); await flush(); assert.equal(signal.aborted, true); assert.equal(bodyCancelled, true) }
     assert.equal(store.getSnapshot().error, oversized ? 'invalid' : 'timeout'); off(); assert.equal(env.timers.size, 0)
   }
 })

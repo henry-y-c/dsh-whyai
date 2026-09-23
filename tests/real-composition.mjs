@@ -213,7 +213,7 @@ async function bootAndProbe(port) {
   const webController = new AbortController()
   const incomplete = (code) => new Error(`dsh boot exited ${code} before probes completed (toolDone=${result !== undefined}, webDone=${webDone}): ${redact(buffer).slice(-2_000)}`)
   const { done, stop } = managedCommand(['--profile', 'web', '--host', '127.0.0.1', '--port', String(port), '--no-open'], {
-    timeoutMs: 45_000,
+    timeoutMs: 90_000,
     onStop: () => webController.abort(),
     onExit: (code) => {
       if (result === undefined || !webDone) throw incomplete(code)

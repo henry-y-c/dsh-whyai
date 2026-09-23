@@ -104,7 +104,7 @@ test('deadline covers both commands and waits for runner cleanup before settleme
   const summaryCall = deferred()
   let signal
   let calls = 0
-  const access = new WhyAiAccess({ invoke(_args, _stdin, s) { signal = s; return ++calls === 1 ? accessCall.promise : summaryCall.promise } })
+  const access = new WhyAiAccess({ invoke(_args, _stdin, s) { signal = s; return ++calls === 1 ? accessCall.promise : summaryCall.promise } }, undefined, 10_000)
   let settled = false
   const pending = access.get().then((result) => { settled = true; return result })
   await flush()
@@ -127,7 +127,7 @@ test('late access completion after deadline cannot start summary', async (t) => 
   t.mock.timers.enable({ apis: ['setTimeout'] })
   const call = deferred()
   let calls = 0
-  const access = new WhyAiAccess({ invoke() { calls++; return call.promise } })
+  const access = new WhyAiAccess({ invoke() { calls++; return call.promise } }, undefined, 10_000)
   const pending = access.get()
   await flush()
   t.mock.timers.tick(10_000)
@@ -226,7 +226,7 @@ test('timeout includes the existing runner queue and removes queued access work'
   }, { ...CONFIG, timeoutMs: 60_000 })
   const tool = runner.invoke(['--json', 'auth', 'status'], undefined, new AbortController().signal)
   await flush()
-  const access = new WhyAiAccess(runner)
+  const access = new WhyAiAccess(runner, undefined, 10_000)
   const pending = access.get()
   await flush()
   t.mock.timers.tick(10_000)
